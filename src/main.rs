@@ -100,60 +100,63 @@ async fn main() -> anyhow::Result<()> {
         .hook("custommsg", handler::handle_custommsg)
         .hook("htlc_accepted", handler::handle_htlc_accepted)
         .hook("rpc_command", handler::handle_rpc_command)
-        .rpcmethod(
-            "canopusd-list",
-            "List all hosted channels",
-            handler::handle_list,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-list", handler::handle_list)
+                .usage("")
+                .description("List all hosted channels known to canopusd, returning each peer id and derived channel status."),
         )
-        .rpcmethod(
-            "canopusd-channel",
-            "Get details of a hosted channel {peerid}",
-            handler::handle_channel,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-channel", handler::handle_channel)
+                .usage("peerid")
+                .description("Show the full persisted hosted-channel state for peerid, including the current status and channel data. Returns null if no channel is known for that peer."),
         )
-        .rpcmethod(
-            "canopusd-addsecret",
-            "Add a channel provisioning secret {secret, capacity_msat, initial_balance_msat}",
-            handler::handle_add_secret,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-addsecret", handler::handle_add_secret)
+                .usage("secret capacity_msat initial_balance_msat")
+                .description("Create a one-time channel provisioning secret. A client invoking a hosted channel with this secret receives the supplied total channel capacity and initial client balance, both in millisatoshi."),
         )
-        .rpcmethod(
-            "canopusd-removesecret",
-            "Remove a channel provisioning secret {secret}",
-            handler::handle_remove_secret,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new(
+                "canopusd-removesecret",
+                handler::handle_remove_secret,
+            )
+            .usage("secret")
+            .description("Remove an unused channel provisioning secret so it can no longer be consumed by a hosted-channel client."),
         )
-        .rpcmethod(
-            "canopusd-listsecrets",
-            "List channel provisioning secrets (redacted)",
-            handler::handle_list_secrets,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-listsecrets", handler::handle_list_secrets)
+                .usage("")
+                .description("List configured channel provisioning secrets with secret values redacted. Use this to audit available one-time hosted-channel invitations."),
         )
-        .rpcmethod(
-            "canopusd-reset",
-            "Reset an errored channel by proposing a state override {peerid, new_local_balance_msat?}",
-            handler::handle_reset,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-reset", handler::handle_reset)
+                .usage("peerid [new_local_balance_msat]")
+                .description("Propose a state_override for an errored hosted channel. If new_local_balance_msat is provided, the override uses that local balance; otherwise canopusd proposes a reset from current state."),
         )
-        .rpcmethod(
-            "canopusd-resize",
-            "Allow a hosted channel resize up to {peerid, capacity_sat}; capacity_sat=0 cancels",
-            handler::handle_resize,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-resize", handler::handle_resize)
+                .usage("peerid capacity_sat")
+                .description("Authorize a hosted-channel resize requested by peerid up to capacity_sat. Set capacity_sat to 0 to cancel a previously authorized resize."),
         )
-        .rpcmethod(
-            "canopusd-policy",
-            "Get or update default channel policy parameters",
-            handler::handle_policy,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-policy", handler::handle_policy)
+                .usage("[channel_capacity_msat] [initial_client_balance_msat] [max_htlc_value_in_flight_msat] [htlc_minimum_msat] [max_accepted_htlcs] [fee_base_msat] [fee_proportional_millionths] [cltv_expiry_delta]")
+                .description("Show or update the default hosted-channel policy. Omitted fields keep their current values. These defaults apply to new channels and to invocations that do not consume a provisioning secret."),
         )
-        .rpcmethod(
-            "canopusd-events",
-            "List accounting events {peerid?}",
-            handler::handle_events,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-events", handler::handle_events)
+                .usage("[peerid]")
+                .description("List canopusd accounting events. When peerid is supplied, only events for that hosted-channel peer are returned."),
         )
-        .rpcmethod(
-            "canopusd-status",
-            "Show canopusd lock/runtime status",
-            handler::handle_status,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-status", handler::handle_status)
+                .usage("")
+                .description("Show whether canopusd is locked or unlocked. When locked, the response includes the reason and hsm_secret path; when unlocked, it includes the node id."),
         )
-        .rpcmethod(
-            "canopusd-unlock",
-            "Unlock encrypted hsm_secret using {passphrase? passphrase_file?}. Direct passphrase is less secure; prefer passphrase_file or a shell prompt.",
-            handler::handle_unlock,
+        .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-unlock", handler::handle_unlock)
+                .usage("passphrase | passphrase_file")
+                .description("Unlock canopusd when the CLN hsm_secret requires a passphrase. Provide exactly one of passphrase or passphrase_file. Prefer passphrase_file because direct passphrase arguments may be visible in shell history or process lists."),
         );
 
     let Some(configured) = builder.configure().await? else {
