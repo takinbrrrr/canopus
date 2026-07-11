@@ -69,15 +69,15 @@ All options can be set in the CLN config file or on the command line:
 | `canopusd-fee-base-msat` | int | 1000 | Base fee for forwarding |
 | `canopusd-fee-ppm` | int | 1000 | Proportional fee (parts per million) |
 | `canopusd-cltv-delta` | int | 137 | CLTV expiry delta |
-| `canopusd-htlc-min-msat` | int | 1000 | Minimum HTLC amount |
+| `canopusd-htlc-min-msat` | int | 546000 | Minimum HTLC amount |
 | `canopusd-max-htlcs` | int | 12 | Max accepted HTLCs per channel |
-| `canopusd-max-inflight-msat` | int | 50000000 | Max HTLC value in flight |
+| `canopusd-max-inflight-msat` | int | 100000000 | Max HTLC value in flight |
 
 ### Other
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `canopusd-require-secret` | bool | false | Require a secret for channel invocation |
+| `canopusd-require-secret` | bool | true | Require a secret for channel invocation |
 | `canopusd-preimage-scan` | bool | true | Scan blocks for OP_RETURN-published preimages |
 
 ### Example

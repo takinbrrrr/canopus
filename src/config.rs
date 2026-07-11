@@ -45,8 +45,8 @@ impl Default for ChannelPolicy {
         Self {
             channel_capacity_msat: 100_000_000, // 100k sats
             initial_client_balance_msat: 0,
-            max_htlc_value_in_flight_msat: 50_000_000, // 50k sats
-            htlc_minimum_msat: 1_000,
+            max_htlc_value_in_flight_msat: 100_000_000, // 100k sats
+            htlc_minimum_msat: 546_000,
             max_accepted_htlcs: 12,
             fee_base_msat: 1_000,
             fee_proportional_millionths: 1_000,
@@ -86,7 +86,7 @@ impl Default for Config {
         Self {
             policy: ChannelPolicy::default(),
             branding: Branding::default(),
-            require_secret: false,
+            require_secret: true,
             preimage_scan: true,
             hsm_secret_path: PathBuf::new(),
             chain_hash: [0u8; 32],
@@ -182,6 +182,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cliche_compatible_defaults() {
+        let config = Config::default();
+        assert!(config.require_secret);
+        assert_eq!(config.policy.max_htlc_value_in_flight_msat, 100_000_000);
+        assert_eq!(config.policy.htlc_minimum_msat, 546_000);
+    }
 
     #[test]
     fn valid_color() {

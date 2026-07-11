@@ -2054,16 +2054,11 @@ mod tests {
     use crate::node::MockNode;
     use crate::store::MemoryStore;
 
-    async fn make_controller() -> (ChannelController, Arc<MockNode>) {
+    async fn make_controller_with_config(config: Config) -> (ChannelController, Arc<MockNode>) {
         let secp = secp256k1::Secp256k1::new();
         let (secret, public) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let store = Arc::new(MemoryStore::new());
         let node = Arc::new(MockNode::new(700_000, public, "regtest"));
-        let config = Config {
-            chain_hash: [0x06u8; 32],
-            network: "regtest".to_string(),
-            ..Config::default()
-        };
         let controller = ChannelController {
             store: store.clone(),
             node: node.clone(),
@@ -2073,6 +2068,16 @@ mod tests {
             peer_wire_encodings: Arc::new(Mutex::new(HashMap::new())),
         };
         (controller, node)
+    }
+
+    async fn make_controller() -> (ChannelController, Arc<MockNode>) {
+        let config = Config {
+            chain_hash: [0x06u8; 32],
+            network: "regtest".to_string(),
+            require_secret: false,
+            ..Config::default()
+        };
+        make_controller_with_config(config).await
     }
 
     fn make_invoke(secret: &str) -> InvokeHostedChannel {
@@ -2207,6 +2212,31 @@ mod tests {
         // Should not send init (secret required, none provided)
         let sent = node.sent_messages.lock().unwrap();
         assert!(sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_requires_secret_without_secret_ignored() {
+        let config = Config {
+            chain_hash: [0x06u8; 32],
+            network: "regtest".to_string(),
+            ..Config::default()
+        };
+        let (controller, node) = make_controller_with_config(config).await;
+
+        let secp = secp256k1::Secp256k1::new();
+        let (_, client_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+
+        controller
+            .handle_invoke(&client_public, make_invoke(""))
+            .await
+            .unwrap();
+
+        assert!(node.sent_messages.lock().unwrap().is_empty());
+        assert!(controller
+            .load_channel(&client_public)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
