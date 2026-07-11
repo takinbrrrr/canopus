@@ -133,10 +133,11 @@ lightning-cli canopusd-channel 028789...
 
 ### `canopusd-addsecret secret capacity_msat initial_balance_msat`
 
-Add a one-time channel provisioning secret. When a client invokes with this secret, they get a channel with the specified capacity and initial balance. The secret is consumed atomically on use.
+Add a one-time channel provisioning secret. The secret must be a 64-character hex string representing 32 random bytes. When a client invokes with this secret, they get a channel with the specified capacity and initial balance. The secret is consumed atomically on use.
 
 ```bash
-lightning-cli canopusd-addsecret my-secret-123 500000000 100000000
+SECRET=$(openssl rand -hex 32)
+lightning-cli canopusd-addsecret "$SECRET" 500000000 100000000
 ```
 
 ### `canopusd-removesecret secret`
@@ -144,7 +145,7 @@ lightning-cli canopusd-addsecret my-secret-123 500000000 100000000
 Remove an unused secret.
 
 ```bash
-lightning-cli canopusd-removesecret my-secret-123
+lightning-cli canopusd-removesecret "$SECRET"
 ```
 
 ### `canopusd-listsecrets`
@@ -223,7 +224,7 @@ tests/
 7. **Restart idempotency**: htlc-forwards map + preimage cache prevent duplicate processing
 8. **Startup grace period**: HTLC processing delayed during first 10 seconds to allow channel re-establishment
 9. **OP_RETURN scanner**: monitors for client-published preimages to protect host funds
-10. **Constant-time secret comparison**: prevents timing attacks on provisioning secrets
+10. **Binary provisioning secrets**: one-time 32-byte secrets are stored and matched by their raw bytes
 11. **Secret zeroization**: node private key bytes are zeroized on drop
 
 ## Testing
@@ -300,12 +301,13 @@ Since the sandbox environment doesn't have lightningd, bitcoind, or cliche insta
 
 3. Add a provisioning secret:
    ```bash
-   lightning-cli canopusd-addsecret test-secret 1000000000 500000000
+   SECRET=$(openssl rand -hex 32)
+   lightning-cli canopusd-addsecret "$SECRET" 1000000000 500000000
    ```
 
 4. Start cliche, configured to connect to your lightningd node.
 
-5. From cliche, invoke a hosted channel using the secret.
+5. From cliche, invoke a hosted channel using the same hex secret.
 
 6. Verify the channel is established:
    ```bash

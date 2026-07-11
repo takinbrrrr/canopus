@@ -55,6 +55,14 @@ fn make_invoke(secret: &str) -> InvokeHostedChannel {
     }
 }
 
+fn make_invoke_hex_secret(secret: &str) -> InvokeHostedChannel {
+    InvokeHostedChannel {
+        chain_hash: [0x06u8; 32],
+        refund_scriptpubkey: Bytes::from_static(&[0x00, 0x14, 0x20]),
+        secret: Bytes::from(hex::decode(secret).unwrap()),
+    }
+}
+
 /// Extract the last message sent to a peer from the mock node.
 fn last_sent_message(node: &Arc<MockNode>) -> HostedMessage {
     let sent = node.sent_messages.lock().unwrap();
@@ -144,16 +152,17 @@ async fn test_full_channel_establishment() {
 #[tokio::test]
 async fn test_channel_with_secret() {
     let (controller, node, client_secret, client_public) = make_harness(true).await;
+    let secret = "0101010101010101010101010101010101010101010101010101010101010101";
 
     // Add a secret with custom params
     controller
-        .add_secret("vip-secret".to_string(), 500_000_000, 100_000_000)
+        .add_secret(secret.to_string(), 500_000_000, 100_000_000)
         .await
         .unwrap();
 
     // Establish with the secret
     controller
-        .handle_invoke(&client_public, make_invoke("vip-secret"))
+        .handle_invoke(&client_public, make_invoke_hex_secret(secret))
         .await
         .unwrap();
 
@@ -211,15 +220,16 @@ async fn test_channel_with_secret() {
 #[tokio::test]
 async fn test_secret_consumed_after_use() {
     let (controller, node, _client_secret, client_public) = make_harness(true).await;
+    let secret = "0202020202020202020202020202020202020202020202020202020202020202";
 
     controller
-        .add_secret("once-only".to_string(), 200_000_000, 0)
+        .add_secret(secret.to_string(), 200_000_000, 0)
         .await
         .unwrap();
 
     // First use — should work
     controller
-        .handle_invoke(&client_public, make_invoke("once-only"))
+        .handle_invoke(&client_public, make_invoke_hex_secret(secret))
         .await
         .unwrap();
     assert!(!node.sent_messages.lock().unwrap().is_empty());
@@ -231,7 +241,7 @@ async fn test_secret_consumed_after_use() {
     let secp = Secp256k1::new();
     let (_, client2) = secp.generate_keypair(&mut rand::rngs::OsRng);
     controller
-        .handle_invoke(&client2, make_invoke("once-only"))
+        .handle_invoke(&client2, make_invoke_hex_secret(secret))
         .await
         .unwrap();
     assert!(node.sent_messages.lock().unwrap().is_empty());
@@ -240,14 +250,16 @@ async fn test_secret_consumed_after_use() {
 #[tokio::test]
 async fn test_wrong_secret_ignored() {
     let (controller, node, _client_secret, client_public) = make_harness(true).await;
+    let secret = "0303030303030303030303030303030303030303030303030303030303030303";
+    let wrong_secret = "0404040404040404040404040404040404040404040404040404040404040404";
 
     controller
-        .add_secret("correct".to_string(), 200_000_000, 0)
+        .add_secret(secret.to_string(), 200_000_000, 0)
         .await
         .unwrap();
 
     controller
-        .handle_invoke(&client_public, make_invoke("wrong"))
+        .handle_invoke(&client_public, make_invoke_hex_secret(wrong_secret))
         .await
         .unwrap();
 

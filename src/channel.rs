@@ -136,12 +136,20 @@ impl ChannelController {
     }
 
     /// Get the store key for a secret.
-    fn secret_key(secret: &str) -> Vec<String> {
+    fn secret_key(secret: &[u8]) -> Vec<String> {
         vec![
             "canopusd".to_string(),
             "secrets".to_string(),
-            hex::encode(secret.as_bytes()),
+            hex::encode(secret),
         ]
+    }
+
+    fn parse_secret_hex(secret: &str) -> ChannelResult<[u8; 32]> {
+        let bytes = hex::decode(secret)
+            .map_err(|_| ChannelError::InvalidMessage("secret must be 32-byte hex".into()))?;
+        bytes
+            .try_into()
+            .map_err(|_| ChannelError::InvalidMessage("secret must be 32-byte hex".into()))
     }
 
     pub async fn note_peer_wire_encoding(&self, peer_id: &PublicKey, encoding: WireEncoding) {
@@ -330,8 +338,7 @@ impl ChannelController {
                 );
                 return Ok(());
             }
-            let secret_str = String::from_utf8_lossy(&msg.secret).to_string();
-            match self.consume_secret(&secret_str).await? {
+            match self.consume_secret(&msg.secret).await? {
                 Some(cap) => cap,
                 None => {
                     warn!(
@@ -344,8 +351,7 @@ impl ChannelController {
             }
         } else if !msg.secret.is_empty() {
             // Secret provided but not required — check if it matches a known secret
-            let secret_str = String::from_utf8_lossy(&msg.secret).to_string();
-            match self.consume_secret(&secret_str).await? {
+            match self.consume_secret(&msg.secret).await? {
                 Some(cap) => cap,
                 None => self.effective_policy().await?,
             }
@@ -1404,14 +1410,16 @@ impl ChannelController {
         capacity_msat: u64,
         initial_balance_msat: u64,
     ) -> ChannelResult<()> {
+        let secret_bytes = Self::parse_secret_hex(&secret)?;
+        let secret_hex = hex::encode(secret_bytes);
         let channel_secret = crate::config::ChannelSecret {
-            secret: secret.clone(),
+            secret: secret_hex,
             capacity_msat,
             initial_balance_msat,
             consumed: false,
         };
 
-        let key_vec = Self::secret_key(&secret);
+        let key_vec = Self::secret_key(&secret_bytes);
         let key: Vec<&str> = key_vec.iter().map(|s| s.as_str()).collect();
         crate::store::create_json(self.store.as_ref(), &key, &channel_secret)
             .await
@@ -1426,14 +1434,18 @@ impl ChannelController {
 
     /// Remove a secret.
     pub async fn remove_secret(&self, secret: &str) -> ChannelResult<()> {
-        let key_vec = Self::secret_key(secret);
+        let secret_bytes = Self::parse_secret_hex(secret)?;
+        let key_vec = Self::secret_key(&secret_bytes);
         let key: Vec<&str> = key_vec.iter().map(|s| s.as_str()).collect();
         self.store.delete(&key).await?;
         Ok(())
     }
 
     /// Consume a secret (mark as used). Returns the policy if valid.
-    async fn consume_secret(&self, secret: &str) -> ChannelResult<Option<ChannelPolicy>> {
+    async fn consume_secret(&self, secret: &[u8]) -> ChannelResult<Option<ChannelPolicy>> {
+        if secret.len() != 32 {
+            return Ok(None);
+        }
         let key_vec = Self::secret_key(secret);
         let key: Vec<&str> = key_vec.iter().map(|s| s.as_str()).collect();
 
@@ -2089,6 +2101,14 @@ mod tests {
         }
     }
 
+    fn make_invoke_hex_secret(secret: &str) -> InvokeHostedChannel {
+        InvokeHostedChannel {
+            chain_hash: [0x06u8; 32],
+            refund_scriptpubkey: Bytes::from_static(&[0x00, 0x14, 0x20]),
+            secret: Bytes::from(hex::decode(secret).unwrap()),
+        }
+    }
+
     #[tokio::test]
     async fn establish_channel() {
         let (controller, node) = make_controller().await;
@@ -2293,10 +2313,11 @@ mod tests {
     async fn secret_grants_channel() {
         let (mut controller, node) = make_controller().await;
         controller.config.require_secret = true;
+        let secret = "0101010101010101010101010101010101010101010101010101010101010101";
 
         // Add a secret
         controller
-            .add_secret("my-secret".to_string(), 200_000_000, 50_000_000)
+            .add_secret(secret.to_string(), 200_000_000, 50_000_000)
             .await
             .unwrap();
 
@@ -2304,7 +2325,7 @@ mod tests {
         let (_, client_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
 
         controller
-            .handle_invoke(&client_public, make_invoke("my-secret"))
+            .handle_invoke(&client_public, make_invoke_hex_secret(secret))
             .await
             .unwrap();
 
@@ -2324,9 +2345,10 @@ mod tests {
     async fn secret_consumed_on_use() {
         let (mut controller, node) = make_controller().await;
         controller.config.require_secret = true;
+        let secret = "0202020202020202020202020202020202020202020202020202020202020202";
 
         controller
-            .add_secret("once".to_string(), 200_000_000, 50_000_000)
+            .add_secret(secret.to_string(), 200_000_000, 50_000_000)
             .await
             .unwrap();
 
@@ -2335,7 +2357,7 @@ mod tests {
 
         // First use — should work
         controller
-            .handle_invoke(&client_public, make_invoke("once"))
+            .handle_invoke(&client_public, make_invoke_hex_secret(secret))
             .await
             .unwrap();
         assert_eq!(node.sent_messages.lock().unwrap().len(), 1);
@@ -2343,11 +2365,25 @@ mod tests {
         // Second use — should be ignored (secret consumed)
         let (_, client2) = secp.generate_keypair(&mut rand::rngs::OsRng);
         controller
-            .handle_invoke(&client2, make_invoke("once"))
+            .handle_invoke(&client2, make_invoke_hex_secret(secret))
             .await
             .unwrap();
         // No new message sent
         assert_eq!(node.sent_messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_secret_hex_rejected() {
+        let (controller, _node) = make_controller().await;
+
+        assert!(controller
+            .add_secret("not-hex".to_string(), 200_000_000, 50_000_000)
+            .await
+            .is_err());
+        assert!(controller
+            .add_secret("00".to_string(), 200_000_000, 50_000_000)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

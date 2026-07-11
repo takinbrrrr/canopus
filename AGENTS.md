@@ -62,7 +62,7 @@ tests/
 ## Key Design Decisions (confirmed with user)
 
 1. **Node key access**: reads `hsm_secret` directly and derives the node key via HKDF. Plain, mnemonic, and passphrase-protected CLN secret formats are supported. Passphrase-protected secrets start the plugin locked; unlock with `canopusd-unlock passphrase_file=...` or the less secure direct `passphrase=...`. No CLN RPC can produce the needed signatures. The key/passphrase buffers are zeroized where practical.
-2. **Secrets**: one-time use, persisted in datastore, consumed atomically via generation CAS. Per-secret capacity and initial balance. Constant-time comparison to prevent timing attacks.
+2. **Secrets**: one-time 32-byte values, provisioned as 64-character hex strings, persisted in datastore by raw-byte hex key, consumed atomically via generation CAS. Per-secret capacity and initial balance.
 3. **Accounting**: own append-only ledger in the datastore (not CLN's bookkeeper, which can't ingest plugin HTLCs). Emits custom notifications (`canopusd_htlc_settled`, etc.) for other plugins.
 4. **Datastore generation CAS**: all writes use read(generation) → modify → update(must-replace, generation). The `cas_json` free function retries on `GenerationMismatch` up to 10 times.
 5. **Feature bits**: init = {257}, node = {257}. Legacy hosted-channel feature bit 32973 is intentionally not advertised. Do not call `Builder::dynamic()`; CLN requires `dynamic: false` for plugins that advertise custom feature bits, and `cln-plugin` defaults to non-dynamic.

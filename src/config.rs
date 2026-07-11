@@ -160,25 +160,6 @@ pub struct ChannelSecret {
     pub consumed: bool,
 }
 
-impl ChannelSecret {
-    /// Compare a provided secret in constant time.
-    pub fn matches(&self, provided: &[u8]) -> bool {
-        constant_time_eq(self.secret.as_bytes(), provided)
-    }
-}
-
-/// Constant-time comparison to prevent timing attacks on secrets.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,27 +214,5 @@ mod tests {
         let mut config = Config::default();
         config.branding.contact_url = Some("not a url".to_string());
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn constant_time_eq_basic() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(!constant_time_eq(b"", b"a"));
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn secret_matches() {
-        let s = ChannelSecret {
-            secret: "my-secret".to_string(),
-            capacity_msat: 100_000,
-            initial_balance_msat: 0,
-            consumed: false,
-        };
-        assert!(s.matches(b"my-secret"));
-        assert!(!s.matches(b"wrong"));
-        assert!(!s.matches(b"my-secret2"));
     }
 }
