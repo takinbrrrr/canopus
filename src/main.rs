@@ -4,6 +4,14 @@ use canopusd::cln_store::ClnStore;
 use canopusd::config::Config;
 use canopusd::keys::NodeKeys;
 use canopusd::ledger::LedgerManager;
+use canopusd::wire::{
+    TAG_ANNOUNCEMENT_SIGNATURE, TAG_ASK_BRANDING_INFO, TAG_ERROR, TAG_HOSTED_CHANNEL_BRANDING,
+    TAG_INIT_HOSTED_CHANNEL, TAG_INVOKE_HOSTED_CHANNEL, TAG_LAST_CROSS_SIGNED_STATE,
+    TAG_PHC_CHANNEL_UPDATE_GOSSIP, TAG_PHC_CHANNEL_UPDATE_SYNC, TAG_QUERY_PREIMAGES,
+    TAG_QUERY_PUBLIC_HOSTED_CHANNELS, TAG_REPLY_PREIMAGES, TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END,
+    TAG_RESIZE_CHANNEL, TAG_STATE_OVERRIDE, TAG_STATE_UPDATE, TAG_UPDATE_ADD_HTLC,
+    TAG_UPDATE_FAIL_HTLC, TAG_UPDATE_FAIL_MALFORMED_HTLC, TAG_UPDATE_FULFILL_HTLC,
+};
 use cln_plugin::options::Value;
 use cln_plugin::options::{BooleanConfigOption, ConfigOption};
 use std::path::PathBuf;
@@ -97,6 +105,28 @@ async fn main() -> anyhow::Result<()> {
         .subscribe("disconnect", handler::handle_disconnect)
         .subscribe("sendpay_success", handler::handle_sendpay_success)
         .subscribe("sendpay_failure", handler::handle_sendpay_failure)
+        .custommessages(vec![
+            TAG_INVOKE_HOSTED_CHANNEL,
+            TAG_INIT_HOSTED_CHANNEL,
+            TAG_LAST_CROSS_SIGNED_STATE,
+            TAG_STATE_UPDATE,
+            TAG_STATE_OVERRIDE,
+            TAG_HOSTED_CHANNEL_BRANDING,
+            TAG_ANNOUNCEMENT_SIGNATURE,
+            TAG_RESIZE_CHANNEL,
+            TAG_QUERY_PUBLIC_HOSTED_CHANNELS,
+            TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END,
+            TAG_QUERY_PREIMAGES,
+            TAG_REPLY_PREIMAGES,
+            TAG_ASK_BRANDING_INFO,
+            TAG_UPDATE_ADD_HTLC,
+            TAG_UPDATE_FULFILL_HTLC,
+            TAG_UPDATE_FAIL_HTLC,
+            TAG_UPDATE_FAIL_MALFORMED_HTLC,
+            TAG_ERROR,
+            TAG_PHC_CHANNEL_UPDATE_GOSSIP,
+            TAG_PHC_CHANNEL_UPDATE_SYNC,
+        ])
         .hook("custommsg", handler::handle_custommsg)
         .hook("htlc_accepted", handler::handle_htlc_accepted)
         .hook("rpc_command", handler::handle_rpc_command)
@@ -616,7 +646,20 @@ mod handler {
         let bytes = hex::decode(message)?;
         let msg = match HostedMessage::decode(&bytes) {
             Ok(msg) => msg,
-            Err(_) => return Ok(json!({ "result": "continue" })),
+            Err(err) => {
+                let tag = bytes
+                    .get(..2)
+                    .map(|raw| u16::from_be_bytes([raw[0], raw[1]]));
+                tracing::warn!(
+                    %peer_id,
+                    ?tag,
+                    message_len = bytes.len(),
+                    error_type = "decode_error",
+                    error_message = %err,
+                    "failed to decode custommsg"
+                );
+                return Ok(json!({ "result": "continue" }));
+            }
         };
         let controller = controller(&plugin).await?;
         match msg {

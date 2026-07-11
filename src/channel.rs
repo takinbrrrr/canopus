@@ -304,14 +304,22 @@ impl ChannelController {
         // Check secret if required
         let policy = if self.config.require_secret {
             if msg.secret.is_empty() {
-                debug!("invoke without secret, but secret required — ignoring");
+                warn!(
+                    %peer_id,
+                    error_type = "missing_required_secret",
+                    "ignoring invoke_hosted_channel"
+                );
                 return Ok(());
             }
             let secret_str = String::from_utf8_lossy(&msg.secret).to_string();
             match self.consume_secret(&secret_str).await? {
                 Some(cap) => cap,
                 None => {
-                    debug!("invalid secret provided — ignoring");
+                    warn!(
+                        %peer_id,
+                        error_type = "unknown_or_consumed_secret",
+                        "ignoring invoke_hosted_channel"
+                    );
                     return Ok(());
                 }
             }
