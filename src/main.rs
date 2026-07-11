@@ -450,6 +450,25 @@ mod handler {
             .map_err(|_| anyhow::anyhow!("expected 32-byte hex value"))
     }
 
+    pub(super) fn hook_continue() -> Value {
+        json!({ "result": "continue" })
+    }
+
+    pub(super) fn htlc_fail_temp_channel_failure() -> Value {
+        json!({ "result": "fail", "failure_message": "1007" })
+    }
+
+    pub(super) fn rpc_hook_error(code: i64, message: impl Into<String>) -> Value {
+        json!({
+            "return": {
+                "error": {
+                    "code": code,
+                    "message": message.into(),
+                }
+            }
+        })
+    }
+
     fn resolution_to_json(resolution: HtlcResolution) -> Value {
         match resolution {
             HtlcResolution::Resolve { preimage } => {
@@ -464,7 +483,7 @@ mod handler {
                 message.extend_from_slice(&data);
                 json!({ "result": "fail", "failure_message": hex::encode(message) })
             }
-            HtlcResolution::Continue => json!({ "result": "continue" }),
+            HtlcResolution::Continue => hook_continue(),
         }
     }
 
@@ -632,20 +651,41 @@ mod handler {
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
         if is_locked(&plugin).await {
-            return Ok(json!({ "result": "continue" }));
+            return Ok(hook_continue());
         }
-        let peer_id = request
+        let Some(peer_id) = request
             .get("peer_id")
             .or_else(|| request.get("node_id"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("custommsg missing peer_id"))?;
-        let message = request
+        else {
+            tracing::warn!(
+                error_type = "missing_peer_id",
+                "ignoring malformed custommsg hook payload"
+            );
+            return Ok(hook_continue());
+        };
+        let Some(message) = request
             .get("message")
             .or_else(|| request.get("payload"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("custommsg missing message"))?;
-        let peer_id = parse_peer(peer_id)?;
-        let bytes = hex::decode(message)?;
+        else {
+            tracing::warn!(%peer_id, error_type = "missing_message", "ignoring malformed custommsg hook payload");
+            return Ok(hook_continue());
+        };
+        let peer_id = match parse_peer(peer_id) {
+            Ok(peer_id) => peer_id,
+            Err(err) => {
+                tracing::warn!(%peer_id, error_type = "invalid_peer_id", error_message = %err, "ignoring malformed custommsg hook payload");
+                return Ok(hook_continue());
+            }
+        };
+        let bytes = match hex::decode(message) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(%peer_id, error_type = "invalid_message_hex", error_message = %err, "ignoring malformed custommsg hook payload");
+                return Ok(hook_continue());
+            }
+        };
         let decoded = match HostedMessage::decode_legacy_aware(&bytes) {
             Ok(decoded) => decoded,
             Err(err) => {
@@ -660,7 +700,7 @@ mod handler {
                     error_message = %err,
                     "failed to decode custommsg"
                 );
-                return Ok(json!({ "result": "continue" }));
+                return Ok(hook_continue());
             }
         };
         let controller = controller(&plugin).await?;
@@ -701,7 +741,7 @@ mod handler {
             | HostedMessage::ReplyPublicHostedChannelsEnd(_)
             | HostedMessage::PhcChannelUpdate(_) => {}
         }
-        Ok(json!({ "result": "continue" }))
+        Ok(hook_continue())
     }
 
     pub async fn handle_htlc_accepted(
@@ -709,7 +749,7 @@ mod handler {
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
         if is_locked(&plugin).await {
-            return Ok(json!({ "result": "continue" }));
+            return Ok(hook_continue());
         }
         let controller = controller(&plugin).await?;
         let cln_node = cln_node(&plugin).await?;
@@ -724,81 +764,97 @@ mod handler {
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<u64>().ok())
         else {
-            return Ok(json!({ "result": "continue" }));
+            return Ok(hook_continue());
         };
-        let Some(peer_id) = controller
-            .list_channels()
-            .await?
+        let channels = match controller.list_channels().await {
+            Ok(channels) => channels,
+            Err(err) => {
+                tracing::warn!(%target_scid, error_message = %err, "could not list hosted channels for htlc_accepted hook");
+                return Ok(hook_continue());
+            }
+        };
+        let Some(peer_id) = channels
             .into_iter()
             .find(|peer| hosted_short_channel_id(&controller.node_public, peer) == target_scid)
         else {
-            return Ok(json!({ "result": "continue" }));
+            return Ok(hook_continue());
         };
-        let incoming_amount_msat = htlc
-            .get("amount_msat")
-            .and_then(parse_msat)
-            .ok_or_else(|| anyhow::anyhow!("htlc missing amount_msat"))?;
-        let amount_msat = onion
-            .get("forward_amount")
-            .or_else(|| onion.get("forward_msat"))
-            .and_then(parse_msat)
-            .unwrap_or(incoming_amount_msat);
-        let payment_hash = htlc
-            .get("payment_hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("htlc missing payment_hash"))
-            .and_then(parse_32_hex)?;
-        let incoming_cltv_expiry =
-            htlc.get("cltv_expiry")
+        let result: Result<Value, cln_plugin::Error> = async {
+            let incoming_amount_msat = htlc
+                .get("amount_msat")
+                .and_then(parse_msat)
+                .ok_or_else(|| anyhow::anyhow!("htlc missing amount_msat"))?;
+            let amount_msat = onion
+                .get("forward_amount")
+                .or_else(|| onion.get("forward_msat"))
+                .and_then(parse_msat)
+                .unwrap_or(incoming_amount_msat);
+            let payment_hash = htlc
+                .get("payment_hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("htlc missing payment_hash"))
+                .and_then(parse_32_hex)?;
+            let incoming_cltv_expiry = htlc
+                .get("cltv_expiry")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("htlc missing cltv_expiry"))? as u32;
-        let cltv_expiry = onion
-            .get("outgoing_cltv_value")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(incoming_cltv_expiry);
-        let next_onion = onion
-            .get("next_onion")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("onion missing next_onion"))?;
-        let htlc_id = htlc.get("id").and_then(|v| v.as_u64()).unwrap_or_default();
-        let incoming_scid = htlc
-            .get("short_channel_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(target_scid);
-        let result_key = format!("{incoming_scid}/{htlc_id}");
-        let shared_secret = onion
-            .get("shared_secret")
-            .and_then(|v| v.as_str())
-            .map(parse_32_hex)
-            .transpose()?;
-        let htlc = UpdateAddHtlc {
-            channel_id: [0u8; 32],
-            id: 0,
-            amount_msat,
-            payment_hash,
-            cltv_expiry,
-            onion_routing_packet: Bytes::from(hex::decode(next_onion)?),
-            tlv_stream: Bytes::new(),
-        };
-        controller
-            .channel_handle_htlc_add(
-                &peer_id,
-                htlc,
-                &result_key,
-                incoming_scid,
-                htlc_id,
-                shared_secret,
-            )
-            .await?;
-        for _ in 0..600 {
-            if let Some(resolution) = cln_node.take_resolution(&result_key).await {
-                return Ok(resolution_to_json(resolution));
+                .ok_or_else(|| anyhow::anyhow!("htlc missing cltv_expiry"))?
+                as u32;
+            let cltv_expiry = onion
+                .get("outgoing_cltv_value")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(incoming_cltv_expiry);
+            let next_onion = onion
+                .get("next_onion")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("onion missing next_onion"))?;
+            let htlc_id = htlc.get("id").and_then(|v| v.as_u64()).unwrap_or_default();
+            let incoming_scid = htlc
+                .get("short_channel_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(target_scid);
+            let result_key = format!("{incoming_scid}/{htlc_id}");
+            let shared_secret = onion
+                .get("shared_secret")
+                .and_then(|v| v.as_str())
+                .map(parse_32_hex)
+                .transpose()?;
+            let htlc = UpdateAddHtlc {
+                channel_id: [0u8; 32],
+                id: 0,
+                amount_msat,
+                payment_hash,
+                cltv_expiry,
+                onion_routing_packet: Bytes::from(hex::decode(next_onion)?),
+                tlv_stream: Bytes::new(),
+            };
+            controller
+                .channel_handle_htlc_add(
+                    &peer_id,
+                    htlc,
+                    &result_key,
+                    incoming_scid,
+                    htlc_id,
+                    shared_secret,
+                )
+                .await?;
+            for _ in 0..600 {
+                if let Some(resolution) = cln_node.take_resolution(&result_key).await {
+                    return Ok(resolution_to_json(resolution));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(htlc_fail_temp_channel_failure())
         }
-        Ok(json!({ "result": "fail", "failure_message": "1007" }))
+        .await;
+        match result {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                tracing::warn!(%peer_id, %target_scid, error_message = %err, "failed to process hosted htlc_accepted hook");
+                Ok(htlc_fail_temp_channel_failure())
+            }
+        }
     }
 
     pub async fn handle_rpc_command(
@@ -811,49 +867,33 @@ mod handler {
             .or_else(|| request.get("method"))
             .and_then(|v| v.as_str());
         if is_locked(&plugin).await {
-            return Ok(json!({ "result": "continue" }));
+            return Ok(hook_continue());
         }
         let controller = controller(&plugin).await?;
         if method == Some("pay") {
             let Some(bolt11) = rpc_param(&request, "bolt11", 0).and_then(|v| v.as_str()) else {
-                return Ok(json!({ "result": "continue" }));
+                return Ok(hook_continue());
             };
             let Ok(invoice) = bolt11.parse::<Bolt11Invoice>() else {
-                return Ok(json!({ "result": "continue" }));
+                return Ok(hook_continue());
             };
             let amount_msat = rpc_param(&request, "amount_msat", 1)
                 .or_else(|| rpc_param(&request, "msatoshi", 1))
                 .and_then(parse_msat)
                 .or_else(|| invoice.amount_milli_satoshis());
             let Some(amount_msat) = amount_msat else {
-                return Ok(json!({ "result": "continue" }));
+                return Ok(hook_continue());
             };
-            let Some(peer_id) = hosted_invoice_target(&controller, &invoice).await? else {
-                return Ok(json!({ "result": "continue" }));
+            let peer_id = match hosted_invoice_target(&controller, &invoice).await {
+                Ok(Some(peer_id)) => peer_id,
+                Ok(None) => return Ok(hook_continue()),
+                Err(err) => {
+                    tracing::warn!(error_message = %err, "could not inspect hosted invoice target");
+                    return Ok(hook_continue());
+                }
             };
-            let payment_hash = parse_32_hex(&format!("{:x}", invoice.payment_hash()))?;
-            if let Ok(Some(preimage)) = controller.node.lookup_preimage(&payment_hash).await {
-                return Ok(hosted_pay_success(
-                    &peer_id,
-                    &payment_hash,
-                    amount_msat,
-                    preimage,
-                ));
-            }
-            let current_height = controller.node.get_block_height().await.unwrap_or_default();
-            let final_cltv = current_height
-                .saturating_add(invoice.min_final_cltv_expiry_delta() as u32)
-                .saturating_add(controller.effective_policy().await?.cltv_expiry_delta as u32);
-            controller
-                .send_direct_payment(
-                    &peer_id,
-                    amount_msat,
-                    payment_hash,
-                    final_cltv,
-                    Some(invoice.payment_secret().0),
-                )
-                .await?;
-            for _ in 0..600 {
+            let result: Result<Value, cln_plugin::Error> = async {
+                let payment_hash = parse_32_hex(&format!("{:x}", invoice.payment_hash()))?;
                 if let Ok(Some(preimage)) = controller.node.lookup_preimage(&payment_hash).await {
                     return Ok(hosted_pay_success(
                         &peer_id,
@@ -862,18 +902,44 @@ mod handler {
                         preimage,
                     ));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            tracing::info!("direct hosted payment timed out");
-            return Ok(json!({
-                "return": {
-                    "error": {
-                        "message": "direct hosted payment timed out"
+                let current_height = controller.node.get_block_height().await.unwrap_or_default();
+                let final_cltv = current_height
+                    .saturating_add(invoice.min_final_cltv_expiry_delta() as u32)
+                    .saturating_add(controller.effective_policy().await?.cltv_expiry_delta as u32);
+                controller
+                    .send_direct_payment(
+                        &peer_id,
+                        amount_msat,
+                        payment_hash,
+                        final_cltv,
+                        Some(invoice.payment_secret().0),
+                    )
+                    .await?;
+                for _ in 0..600 {
+                    if let Ok(Some(preimage)) = controller.node.lookup_preimage(&payment_hash).await
+                    {
+                        return Ok(hosted_pay_success(
+                            &peer_id,
+                            &payment_hash,
+                            amount_msat,
+                            preimage,
+                        ));
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-            }));
+                tracing::info!(%peer_id, "direct hosted payment timed out");
+                Ok(rpc_hook_error(-32603, "direct hosted payment timed out"))
+            }
+            .await;
+            return match result {
+                Ok(response) => Ok(response),
+                Err(err) => {
+                    tracing::warn!(%peer_id, error_message = %err, "direct hosted payment failed");
+                    Ok(rpc_hook_error(-32603, err.to_string()))
+                }
+            };
         }
-        Ok(json!({ "result": "continue" }))
+        Ok(hook_continue())
     }
 
     pub async fn handle_list(
@@ -1126,5 +1192,36 @@ mod tests {
     fn featurebits_empty() {
         let hex = compute_feature_bits_hex(&[]);
         assert_eq!(hex, "00");
+    }
+
+    #[test]
+    fn custommsg_continue_response_shape() {
+        assert_eq!(
+            handler::hook_continue(),
+            serde_json::json!({ "result": "continue" })
+        );
+    }
+
+    #[test]
+    fn htlc_temp_failure_response_shape() {
+        assert_eq!(
+            handler::htlc_fail_temp_channel_failure(),
+            serde_json::json!({ "result": "fail", "failure_message": "1007" })
+        );
+    }
+
+    #[test]
+    fn rpc_hook_error_includes_code() {
+        assert_eq!(
+            handler::rpc_hook_error(-32603, "direct hosted payment timed out"),
+            serde_json::json!({
+                "return": {
+                    "error": {
+                        "code": -32603,
+                        "message": "direct hosted payment timed out",
+                    }
+                }
+            })
+        );
     }
 }
