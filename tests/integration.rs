@@ -362,6 +362,49 @@ async fn test_error_and_reset() {
 }
 
 #[tokio::test]
+async fn test_remote_error_not_replayed_on_reconnect() {
+    use canopusd::wire::HcError;
+
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    let _lcss = establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .handle_error(
+            &client_public,
+            HcError {
+                channel_id: [0; 32],
+                data: Bytes::from_static(b"bad signature"),
+                tlv_stream: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(data.local_errors.is_empty());
+    assert_eq!(data.remote_errors, vec!["bad signature".to_string()]);
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Errored
+    );
+
+    controller
+        .handle_invoke(&client_public, make_invoke(""))
+        .await
+        .unwrap();
+
+    let sent = node.sent_messages.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let msg = HostedMessage::decode(&sent[0].1).unwrap();
+    assert!(matches!(msg, HostedMessage::LastCrossSignedState(_)));
+}
+
+#[tokio::test]
 async fn test_reconnection_lcss_exchange() {
     let (controller, node, client_secret, client_public) = make_harness(false).await;
     let lcss = establish_channel(&controller, &node, &client_secret, &client_public).await;

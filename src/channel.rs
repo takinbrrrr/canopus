@@ -99,7 +99,7 @@ pub fn derive_status(data: &ChannelData) -> Status {
     if data.proposed_override.is_some() {
         return Status::Overriding;
     }
-    if !data.local_errors.is_empty() {
+    if !data.local_errors.is_empty() || !data.remote_errors.is_empty() {
         return Status::Errored;
     }
     if !data.established {
@@ -1100,8 +1100,7 @@ impl ChannelController {
             .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
 
         let error_str = String::from_utf8_lossy(&msg.data).to_string();
-        self.mark_errored(peer_id, &data, &format!("remote error: {}", error_str))
-            .await?;
+        self.mark_remote_errored(peer_id, &data, &error_str).await?;
         Ok(())
     }
 
@@ -1497,6 +1496,23 @@ impl ChannelController {
         self.save_channel(peer_id, &new_data, None).await?;
         warn!(
             "channel {} errored: {}",
+            hex::encode(peer_id.serialize()),
+            error
+        );
+        Ok(())
+    }
+
+    async fn mark_remote_errored(
+        &self,
+        peer_id: &PublicKey,
+        data: &ChannelData,
+        error: &str,
+    ) -> ChannelResult<()> {
+        let mut new_data = data.clone();
+        new_data.remote_errors.push(error.to_string());
+        self.save_channel(peer_id, &new_data, None).await?;
+        warn!(
+            "channel {} errored: remote error: {}",
             hex::encode(peer_id.serialize()),
             error
         );
