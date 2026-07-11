@@ -345,7 +345,15 @@ mod handler {
     use canopusd::channel_id::hosted_short_channel_id;
     use canopusd::node::{HtlcResolution, PaymentStatus};
     use canopusd::wire::codecs::UpdateAddHtlc;
-    use canopusd::wire::HostedMessage;
+    use canopusd::wire::{
+        HostedMessage, TAG_ANNOUNCEMENT_SIGNATURE, TAG_ASK_BRANDING_INFO, TAG_ERROR,
+        TAG_HOSTED_CHANNEL_BRANDING, TAG_INIT_HOSTED_CHANNEL, TAG_INVOKE_HOSTED_CHANNEL,
+        TAG_LAST_CROSS_SIGNED_STATE, TAG_PHC_CHANNEL_UPDATE_GOSSIP, TAG_PHC_CHANNEL_UPDATE_SYNC,
+        TAG_QUERY_PREIMAGES, TAG_QUERY_PUBLIC_HOSTED_CHANNELS, TAG_REPLY_PREIMAGES,
+        TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END, TAG_RESIZE_CHANNEL, TAG_STATE_OVERRIDE,
+        TAG_STATE_UPDATE, TAG_UPDATE_ADD_HTLC, TAG_UPDATE_FAIL_HTLC,
+        TAG_UPDATE_FAIL_MALFORMED_HTLC, TAG_UPDATE_FULFILL_HTLC,
+    };
     use cln_plugin::Plugin;
     use lightning_invoice::Bolt11Invoice;
     use secp256k1::PublicKey;
@@ -467,6 +475,32 @@ mod handler {
                 }
             }
         })
+    }
+
+    pub(super) fn is_canopusd_custom_tag(tag: u16) -> bool {
+        matches!(
+            tag,
+            TAG_INVOKE_HOSTED_CHANNEL
+                | TAG_INIT_HOSTED_CHANNEL
+                | TAG_LAST_CROSS_SIGNED_STATE
+                | TAG_STATE_UPDATE
+                | TAG_STATE_OVERRIDE
+                | TAG_HOSTED_CHANNEL_BRANDING
+                | TAG_ANNOUNCEMENT_SIGNATURE
+                | TAG_RESIZE_CHANNEL
+                | TAG_QUERY_PUBLIC_HOSTED_CHANNELS
+                | TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END
+                | TAG_QUERY_PREIMAGES
+                | TAG_REPLY_PREIMAGES
+                | TAG_ASK_BRANDING_INFO
+                | TAG_UPDATE_ADD_HTLC
+                | TAG_UPDATE_FULFILL_HTLC
+                | TAG_UPDATE_FAIL_HTLC
+                | TAG_UPDATE_FAIL_MALFORMED_HTLC
+                | TAG_ERROR
+                | TAG_PHC_CHANNEL_UPDATE_GOSSIP
+                | TAG_PHC_CHANNEL_UPDATE_SYNC
+        )
     }
 
     fn resolution_to_json(resolution: HtlcResolution) -> Value {
@@ -686,12 +720,18 @@ mod handler {
                 return Ok(hook_continue());
             }
         };
+        let Some(tag) = bytes
+            .get(..2)
+            .map(|raw| u16::from_be_bytes([raw[0], raw[1]]))
+        else {
+            return Ok(hook_continue());
+        };
+        if !is_canopusd_custom_tag(tag) {
+            return Ok(hook_continue());
+        }
         let decoded = match HostedMessage::decode_legacy_aware(&bytes) {
             Ok(decoded) => decoded,
             Err(err) => {
-                let tag = bytes
-                    .get(..2)
-                    .map(|raw| u16::from_be_bytes([raw[0], raw[1]]));
                 tracing::warn!(
                     %peer_id,
                     ?tag,
@@ -1223,5 +1263,13 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn custom_tag_allowlist_matches_canopusd_tags() {
+        assert!(handler::is_canopusd_custom_tag(TAG_INVOKE_HOSTED_CHANNEL));
+        assert!(handler::is_canopusd_custom_tag(TAG_PHC_CHANNEL_UPDATE_SYNC));
+        assert!(!handler::is_canopusd_custom_tag(39409));
+        assert!(!handler::is_canopusd_custom_tag(2111));
     }
 }
