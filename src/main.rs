@@ -693,7 +693,7 @@ mod handler {
             .and_then(|v| v.as_str())
         else {
             tracing::warn!(
-                error_type = "missing_peer_id",
+                error_type = %"missing_peer_id",
                 "ignoring malformed custommsg hook payload"
             );
             return Ok(hook_continue());
@@ -703,20 +703,20 @@ mod handler {
             .or_else(|| request.get("payload"))
             .and_then(|v| v.as_str())
         else {
-            tracing::warn!(%peer_id, error_type = "missing_message", "ignoring malformed custommsg hook payload");
+            tracing::warn!(%peer_id, error_type = %"missing_message", "ignoring malformed custommsg hook payload");
             return Ok(hook_continue());
         };
         let peer_id = match parse_peer(peer_id) {
             Ok(peer_id) => peer_id,
             Err(err) => {
-                tracing::warn!(%peer_id, error_type = "invalid_peer_id", error_message = %err, "ignoring malformed custommsg hook payload");
+                tracing::warn!(%peer_id, error_type = %"invalid_peer_id", error_message = %err, "ignoring malformed custommsg hook payload");
                 return Ok(hook_continue());
             }
         };
         let bytes = match hex::decode(message) {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!(%peer_id, error_type = "invalid_message_hex", error_message = %err, "ignoring malformed custommsg hook payload");
+                tracing::warn!(%peer_id, error_type = %"invalid_message_hex", error_message = %err, "ignoring malformed custommsg hook payload");
                 return Ok(hook_continue());
             }
         };
@@ -736,7 +736,7 @@ mod handler {
                     %peer_id,
                     ?tag,
                     message_len = bytes.len(),
-                    error_type = "decode_error",
+                    error_type = %"decode_error",
                     error_message = %err,
                     "failed to decode custommsg"
                 );

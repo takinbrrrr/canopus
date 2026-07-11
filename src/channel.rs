@@ -325,7 +325,7 @@ impl ChannelController {
             if msg.secret.is_empty() {
                 warn!(
                     %peer_id,
-                    error_type = "missing_required_secret",
+                    error_type = %"missing_required_secret",
                     "ignoring invoke_hosted_channel"
                 );
                 return Ok(());
@@ -336,7 +336,7 @@ impl ChannelController {
                 None => {
                     warn!(
                         %peer_id,
-                        error_type = "unknown_or_consumed_secret",
+                        error_type = %"unknown_or_consumed_secret",
                         "ignoring invoke_hosted_channel"
                     );
                     return Ok(());
