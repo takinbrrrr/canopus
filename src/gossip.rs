@@ -6,8 +6,15 @@ use sha2::{Digest, Sha256};
 
 use crate::channel_id::{hosted_short_channel_id, is_node1};
 use crate::config::ChannelPolicy;
+use crate::wire::{
+    ChannelUpdate, PhcChannelUpdate, TAG_PHC_CHANNEL_UPDATE_SYNC,
+};
 
-pub fn channel_update(
+/// Build a signed BOLT-7 `channel_update` as a typed [`ChannelUpdate`].
+///
+/// The signature covers the double-SHA256 of the witness (everything after
+/// the signature field, including the TLV stream).
+pub fn build_channel_update(
     node_secret: &SecretKey,
     node_public: &PublicKey,
     peer_id: &PublicKey,
@@ -15,22 +22,26 @@ pub fn channel_update(
     policy: &ChannelPolicy,
     enabled: bool,
     timestamp: u32,
-) -> Bytes {
+) -> ChannelUpdate {
     let scid = hosted_short_channel_id(node_public, peer_id);
     let channel_flags = channel_flags(node_public, peer_id, enabled);
 
-    let mut witness = BytesMut::with_capacity(72);
-    witness.extend_from_slice(&chain_hash);
-    witness.put_u64(scid);
-    witness.put_u32(timestamp);
-    witness.put_u8(0x01);
-    witness.put_u8(channel_flags);
-    witness.put_u16(policy.cltv_expiry_delta);
-    witness.put_u64(policy.htlc_minimum_msat);
-    witness.put_u32(policy.fee_base_msat);
-    witness.put_u32(policy.fee_proportional_millionths);
-    witness.put_u64(policy.channel_capacity_msat);
+    let cu = ChannelUpdate {
+        signature: [0u8; 64],
+        chain_hash,
+        short_channel_id: scid,
+        timestamp,
+        message_flags: 0x01,
+        channel_flags,
+        cltv_expiry_delta: policy.cltv_expiry_delta,
+        htlc_minimum_msat: policy.htlc_minimum_msat,
+        fee_base_msat: policy.fee_base_msat,
+        fee_proportional_millionths: policy.fee_proportional_millionths,
+        htlc_maximum_msat: policy.channel_capacity_msat,
+        tlv_stream: Bytes::new(),
+    };
 
+    let witness = cu.witness();
     let first = Sha256::digest(&witness);
     let second = Sha256::digest(first);
     let mut digest = [0u8; 32];
@@ -40,11 +51,64 @@ pub fn channel_update(
     let msg = Message::from_digest(digest);
     let sig = secp.sign_ecdsa(&msg, node_secret).serialize_compact();
 
-    let mut out = BytesMut::with_capacity(2 + 64 + witness.len());
+    ChannelUpdate {
+        signature: sig,
+        ..cu
+    }
+}
+
+/// Build a standard BOLT-7 `channel_update` message (type tag `258` + body).
+pub fn channel_update(
+    node_secret: &SecretKey,
+    node_public: &PublicKey,
+    peer_id: &PublicKey,
+    chain_hash: [u8; 32],
+    policy: &ChannelPolicy,
+    enabled: bool,
+    timestamp: u32,
+) -> Bytes {
+    let cu = build_channel_update(
+        node_secret,
+        node_public,
+        peer_id,
+        chain_hash,
+        policy,
+        enabled,
+        timestamp,
+    );
+    let mut out = BytesMut::with_capacity(2 + 136);
     out.put_u16(258);
-    out.extend_from_slice(&sig);
-    out.extend_from_slice(&witness);
+    let _ = cu.encode(&mut out);
     out.freeze()
+}
+
+/// Build a PHC-wrapped `channel_update` for direct peer sync (tag `64507`).
+///
+/// cliche/immortan uses `PHC_UPDATE_SYNC_TAG` (64507) for outbound hosted
+/// channel updates sent directly to the peer.  The body is identical to the
+/// standard BOLT-7 `channel_update` body (without the `258` type prefix).
+pub fn phc_channel_update_sync(
+    node_secret: &SecretKey,
+    node_public: &PublicKey,
+    peer_id: &PublicKey,
+    chain_hash: [u8; 32],
+    policy: &ChannelPolicy,
+    enabled: bool,
+    timestamp: u32,
+) -> PhcChannelUpdate {
+    let body = build_channel_update(
+        node_secret,
+        node_public,
+        peer_id,
+        chain_hash,
+        policy,
+        enabled,
+        timestamp,
+    );
+    PhcChannelUpdate {
+        tag: TAG_PHC_CHANNEL_UPDATE_SYNC,
+        body,
+    }
 }
 
 pub fn channel_flags(node_public: &PublicKey, peer_id: &PublicKey, enabled: bool) -> u8 {
@@ -66,6 +130,31 @@ mod tests {
         let bytes = channel_update(&sk, &pk, &peer, [1; 32], &policy, true, 1_700_000_000);
         assert_eq!(bytes.len(), 138);
         assert_eq!(&bytes[..2], &[0x01, 0x02]);
+    }
+
+    #[test]
+    fn phc_channel_update_sync_uses_tag_64507() {
+        let secp = Secp256k1::new();
+        let (sk, pk) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        let (_, peer) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        let policy = ChannelPolicy::default();
+        let phc = phc_channel_update_sync(&sk, &pk, &peer, [1; 32], &policy, true, 1_700_000_000);
+        assert_eq!(phc.tag, 64507);
+        let encoded = crate::wire::HostedMessage::PhcChannelUpdate(phc).encode().unwrap();
+        assert_eq!(&encoded[..2], &[0xFB, 0xFB]);
+    }
+
+    #[test]
+    fn phc_body_matches_bolt_body() {
+        let secp = Secp256k1::new();
+        let (sk, pk) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        let (_, peer) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        let policy = ChannelPolicy::default();
+        let bolt = channel_update(&sk, &pk, &peer, [1; 32], &policy, true, 42);
+        let phc = phc_channel_update_sync(&sk, &pk, &peer, [1; 32], &policy, true, 42);
+        let mut phc_encoded = BytesMut::new();
+        phc.body.encode(&mut phc_encoded).unwrap();
+        assert_eq!(&bolt[2..], &phc_encoded[..]);
     }
 
     #[test]

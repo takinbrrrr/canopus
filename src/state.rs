@@ -286,6 +286,7 @@ mod tests {
             payment_hash,
             cltv_expiry: 700_000,
             onion_routing_packet: Bytes::from(vec![0; 1366]),
+            tlv_stream: Bytes::new(),
         }
     }
 

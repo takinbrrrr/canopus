@@ -35,6 +35,8 @@ pub enum ChannelError {
     Store(#[from] StoreError),
     #[error("node error: {0}")]
     Node(#[from] crate::node::NodeError),
+    #[error("encode error: {0}")]
+    Encode(String),
     #[error("channel not found: {0}")]
     NotFound(String),
     #[error("channel is errored")]
@@ -47,6 +49,12 @@ pub enum ChannelError {
     InvalidMessage(String),
     #[error("block day out of range: got {got}, current {current}")]
     BlockDayOutOfRange { got: u32, current: u32 },
+}
+
+impl From<crate::wire::codecs::EncodeError> for ChannelError {
+    fn from(e: crate::wire::codecs::EncodeError) -> Self {
+        ChannelError::Encode(e.to_string())
+    }
 }
 
 pub type ChannelResult<T> = Result<T, ChannelError>;
@@ -246,9 +254,15 @@ impl ChannelController {
     ) -> ChannelResult<()> {
         // Verify chain hash
         if msg.chain_hash != self.config.chain_hash {
+            warn!(
+                expected = %hex::encode(self.config.chain_hash),
+                sent = %hex::encode(msg.chain_hash),
+                "chain hash mismatch"
+            );
             let err = HcError {
                 channel_id: channel_id(&self.node_public, peer_id),
                 data: Bytes::from_static(b"chain hash mismatch"),
+                tlv_stream: Bytes::new(),
             };
             self.send_message(peer_id, HostedMessage::Error(err))
                 .await?;
@@ -404,6 +418,7 @@ impl ChannelController {
                                 channel_id: *channel_id,
                                 id: *id,
                                 payment_preimage: *preimage,
+                                tlv_stream: Bytes::new(),
                             }),
                         )
                         .await?;
@@ -419,6 +434,7 @@ impl ChannelController {
                                 channel_id: *channel_id,
                                 id: *id,
                                 reason: reason.clone(),
+                                tlv_stream: Bytes::new(),
                             }),
                         )
                         .await?;
@@ -437,6 +453,7 @@ impl ChannelController {
                                     id: *id,
                                     sha256_of_onion: *sha256_of_onion,
                                     failure_code: *failure_code,
+                                    tlv_stream: Bytes::new(),
                                 },
                             ),
                         )
@@ -450,7 +467,7 @@ impl ChannelController {
         if !sm.uncommitted.is_empty() {
             let mut next = sm.lcss_next()?;
             next.block_day = self.current_block_day().await?;
-            next.sign(&self.node_secret);
+            next.sign(&self.node_secret)?;
             self.send_message(
                 peer_id,
                 HostedMessage::StateUpdate(StateUpdate {
@@ -484,6 +501,7 @@ impl ChannelController {
             let err = HcError {
                 channel_id: channel_id(&self.node_public, peer_id),
                 data: Bytes::copy_from_slice(err_msg.as_bytes()),
+                tlv_stream: Bytes::new(),
             };
             self.send_message(peer_id, HostedMessage::Error(err))
                 .await?;
@@ -590,7 +608,7 @@ impl ChannelController {
         }
 
         // Sign our view
-        lcss.sign(&self.node_secret);
+        lcss.sign(&self.node_secret)?;
 
         // Persist the established channel
         let mut new_data = data.clone();
@@ -671,7 +689,7 @@ impl ChannelController {
         }
 
         // Sign our view of the next state
-        next.sign(&self.node_secret);
+        next.sign(&self.node_secret)?;
 
         // Persist BEFORE any side effects
         let mut new_data = data.clone();
@@ -731,7 +749,7 @@ impl ChannelController {
         }
 
         // Sign and persist
-        lcss.sign(&self.node_secret);
+        lcss.sign(&self.node_secret)?;
         let new_data = ChannelData {
             lcss: lcss.clone(),
             uncommitted: vec![],
@@ -793,6 +811,7 @@ impl ChannelController {
                     channel_id: htlc.channel_id,
                     id: htlc.id,
                     reason,
+                    tlv_stream: Bytes::new(),
                 }),
             )
             .await?;
@@ -1136,7 +1155,7 @@ impl ChannelController {
             .init_hosted_channel
             .max_htlc_value_in_flight_msat = new_capacity_msat;
         new_data.lcss.local_balance_msat = new_local_balance;
-        new_data.lcss.sign(&self.node_secret);
+        new_data.lcss.sign(&self.node_secret)?;
         self.save_channel(peer_id, &new_data, None).await?;
 
         self.send_message(
@@ -1195,6 +1214,7 @@ impl ChannelController {
                 HostedMessage::Error(HcError {
                     channel_id: channel_id(&self.node_public, peer_id),
                     data: Bytes::from_static(b"bad signature"),
+                    tlv_stream: Bytes::new(),
                 }),
             )
             .await?;
@@ -1323,7 +1343,7 @@ impl ChannelController {
             remote_sig_of_local: [0; 64],
             local_sig_of_remote: [0; 64],
         };
-        override_lcss.sign(&self.node_secret);
+        override_lcss.sign(&self.node_secret)?;
 
         // Persist the proposed override
         let mut new_data = data.clone();
@@ -1451,12 +1471,15 @@ impl ChannelController {
 
     /// Send a message to the peer.
     async fn send_message(&self, peer_id: &PublicKey, msg: HostedMessage) -> ChannelResult<()> {
-        let bytes = msg.encode();
+        let bytes = msg.encode()?;
         self.node.send_custom_msg(peer_id, bytes).await?;
         Ok(())
     }
 
-    /// Send a signed BOLT-7 channel_update gossip message for the fake hosted scid.
+    /// Send a PHC-wrapped channel_update (tag 64507) for the fake hosted scid.
+    ///
+    /// cliche/immortan expects `PHC_UPDATE_SYNC_TAG` (64507) for direct
+    /// peer channel updates, not the standard BOLT-7 tag `258`.
     async fn send_channel_update(&self, peer_id: &PublicKey) -> ChannelResult<()> {
         let data = self
             .load_channel(peer_id)
@@ -1467,7 +1490,7 @@ impl ChannelController {
             .unwrap_or_default()
             .as_secs() as u32;
         let policy = self.effective_policy().await?;
-        let bytes = crate::gossip::channel_update(
+        let phc = crate::gossip::phc_channel_update_sync(
             &self.node_secret,
             &self.node_public,
             peer_id,
@@ -1491,7 +1514,9 @@ impl ChannelController {
             derive_status(&data) == Status::Active,
             timestamp,
         );
-        self.node.send_custom_msg(peer_id, bytes).await?;
+        self.node
+            .send_custom_msg(peer_id, HostedMessage::PhcChannelUpdate(phc).encode()?)
+            .await?;
         Ok(())
     }
 
@@ -1529,6 +1554,7 @@ impl ChannelController {
                     payment_hash: htlc.payment_hash,
                     cltv_expiry: peeled.outgoing_cltv_value,
                     onion_routing_packet: Bytes::from(peeled.next_onion),
+                    tlv_stream: Bytes::new(),
                 };
                 let result_key = format!("{hosted_scid}/{}", htlc.htlc_id());
                 self.channel_handle_htlc_add(
@@ -1663,6 +1689,7 @@ impl ChannelController {
             payment_hash,
             cltv_expiry: final_cltv_expiry,
             onion_routing_packet: Bytes::from(onion),
+            tlv_stream: Bytes::new(),
         };
         let mut new_data = data.clone();
         new_data
@@ -1715,6 +1742,7 @@ impl ChannelController {
                 channel_id: channel_id(&self.node_public, peer_id),
                 id: link.incoming_htlc_id,
                 payment_preimage: preimage,
+                tlv_stream: Bytes::new(),
             }),
         )
         .await?;
@@ -1759,6 +1787,7 @@ impl ChannelController {
                 channel_id: channel_id(&self.node_public, peer_id),
                 id: link.incoming_htlc_id,
                 reason,
+                tlv_stream: Bytes::new(),
             }),
         )
         .await?;
@@ -1772,7 +1801,7 @@ impl ChannelController {
         sm.uncommitted = data.uncommitted.clone();
         let mut next = sm.lcss_next()?;
         next.block_day = self.current_block_day().await?;
-        next.sign(&self.node_secret);
+        next.sign(&self.node_secret)?;
         Ok(StateUpdate {
             block_day: next.block_day,
             local_updates: next.local_updates,
@@ -1928,7 +1957,7 @@ impl ChannelController {
         // Send state_update
         let mut next = sm.lcss_next()?;
         next.block_day = self.current_block_day().await?;
-        next.sign(&self.node_secret);
+        next.sign(&self.node_secret)?;
         self.send_message(
             peer_id,
             HostedMessage::StateUpdate(StateUpdate {
@@ -2074,7 +2103,7 @@ mod tests {
             remote_sig_of_local: [0; 64],
             local_sig_of_remote: [0; 64],
         };
-        client_lcss.sign(&client_secret);
+        client_lcss.sign(&client_secret).unwrap();
 
         let state_update = StateUpdate {
             block_day: client_lcss.block_day,
@@ -2093,12 +2122,16 @@ mod tests {
         let status = controller.get_status(&client_public).await.unwrap();
         assert_eq!(status, Status::Active);
 
-        // Host should have sent init, state_update, and raw BOLT-7 channel_update.
+        // Host should have sent init, state_update, and PHC channel_update (64507).
         let sent = node.sent_messages.lock().unwrap();
         assert_eq!(sent.len(), 3);
         let msg = HostedMessage::decode(&sent[1].1).unwrap();
         assert!(matches!(msg, HostedMessage::StateUpdate(_)));
-        assert_eq!(&sent[2].1[..2], &[0x01, 0x02]);
+        let phc_msg = HostedMessage::decode(&sent[2].1).unwrap();
+        match phc_msg {
+            HostedMessage::PhcChannelUpdate(p) => assert_eq!(p.tag, 64507),
+            other => panic!("expected PhcChannelUpdate, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -2228,7 +2261,7 @@ mod tests {
             remote_sig_of_local: [0; 64],
             local_sig_of_remote: [0; 64],
         };
-        client_lcss.sign(&client_secret);
+        client_lcss.sign(&client_secret).unwrap();
 
         controller
             .handle_state_update(
@@ -2286,7 +2319,7 @@ mod tests {
             .unwrap();
 
         let mut accepted_lcss = override_lcss.reverse();
-        accepted_lcss.sign(&client_secret);
+        accepted_lcss.sign(&client_secret).unwrap();
 
         controller
             .handle_state_update(

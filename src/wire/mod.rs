@@ -8,8 +8,10 @@ pub mod codecs;
 pub mod lcss;
 
 use self::codecs::{
-    read_32, read_signature, read_u32, read_u64, read_varsize, write_32, write_signature,
-    write_u32, write_u64, write_varsize, DecodeError, DecodeResult, UpdateAddHtlc,
+    read_32, read_bytes, read_signature, read_u16, read_u32, read_u64, read_u64_overflow,
+    read_varsize, validate_tlv_stream, write_32, write_signature, write_u16, write_u32,
+    write_u64, write_u64_overflow, write_varsize, DecodeError, DecodeResult, EncodeError,
+    EncodeResult, UpdateAddHtlc,
 };
 use bytes::{Bytes, BytesMut};
 
@@ -20,7 +22,10 @@ pub const TAG_LAST_CROSS_SIGNED_STATE: u16 = 65531;
 pub const TAG_STATE_UPDATE: u16 = 65529;
 pub const TAG_STATE_OVERRIDE: u16 = 65527;
 pub const TAG_HOSTED_CHANNEL_BRANDING: u16 = 65525;
+pub const TAG_ANNOUNCEMENT_SIGNATURE: u16 = 65523;
 pub const TAG_RESIZE_CHANNEL: u16 = 65521;
+pub const TAG_QUERY_PUBLIC_HOSTED_CHANNELS: u16 = 65519;
+pub const TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END: u16 = 65517;
 pub const TAG_QUERY_PREIMAGES: u16 = 65515;
 pub const TAG_REPLY_PREIMAGES: u16 = 65513;
 pub const TAG_ASK_BRANDING_INFO: u16 = 65511;
@@ -29,6 +34,12 @@ pub const TAG_UPDATE_FULFILL_HTLC: u16 = 63503;
 pub const TAG_UPDATE_FAIL_HTLC: u16 = 63501;
 pub const TAG_UPDATE_FAIL_MALFORMED_HTLC: u16 = 63499;
 pub const TAG_ERROR: u16 = 63497;
+
+// PHC gossip / sync tags (from immortan/scoin)
+pub const TAG_PHC_CHANNEL_ANNOUNCEMENT_GOSSIP: u16 = 64513;
+pub const TAG_PHC_CHANNEL_ANNOUNCEMENT_SYNC: u16 = 64511;
+pub const TAG_PHC_CHANNEL_UPDATE_GOSSIP: u16 = 64509;
+pub const TAG_PHC_CHANNEL_UPDATE_SYNC: u16 = 64507;
 
 /// All HC message types.
 #[allow(clippy::large_enum_variant)]
@@ -40,7 +51,10 @@ pub enum HostedMessage {
     StateUpdate(StateUpdate),
     StateOverride(StateOverride),
     HostedChannelBranding(HostedChannelBranding),
+    AnnouncementSignature(AnnouncementSignature),
     ResizeChannel(ResizeChannel),
+    QueryPublicHostedChannels(QueryPublicHostedChannels),
+    ReplyPublicHostedChannelsEnd(ReplyPublicHostedChannelsEnd),
     QueryPreimages(QueryPreimages),
     ReplyPreimages(ReplyPreimages),
     AskBrandingInfo(AskBrandingInfo),
@@ -49,6 +63,8 @@ pub enum HostedMessage {
     UpdateFailHtlc(UpdateFailHtlc),
     UpdateFailMalformedHtlc(UpdateFailMalformedHtlc),
     Error(HcError),
+    /// A PHC-wrapped BOLT-7 `channel_update` (tags 64509 gossip / 64507 sync).
+    PhcChannelUpdate(PhcChannelUpdate),
 }
 
 impl HostedMessage {
@@ -60,7 +76,12 @@ impl HostedMessage {
             HostedMessage::StateUpdate(_) => TAG_STATE_UPDATE,
             HostedMessage::StateOverride(_) => TAG_STATE_OVERRIDE,
             HostedMessage::HostedChannelBranding(_) => TAG_HOSTED_CHANNEL_BRANDING,
+            HostedMessage::AnnouncementSignature(_) => TAG_ANNOUNCEMENT_SIGNATURE,
             HostedMessage::ResizeChannel(_) => TAG_RESIZE_CHANNEL,
+            HostedMessage::QueryPublicHostedChannels(_) => TAG_QUERY_PUBLIC_HOSTED_CHANNELS,
+            HostedMessage::ReplyPublicHostedChannelsEnd(_) => {
+                TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END
+            }
             HostedMessage::QueryPreimages(_) => TAG_QUERY_PREIMAGES,
             HostedMessage::ReplyPreimages(_) => TAG_REPLY_PREIMAGES,
             HostedMessage::AskBrandingInfo(_) => TAG_ASK_BRANDING_INFO,
@@ -69,31 +90,36 @@ impl HostedMessage {
             HostedMessage::UpdateFailHtlc(_) => TAG_UPDATE_FAIL_HTLC,
             HostedMessage::UpdateFailMalformedHtlc(_) => TAG_UPDATE_FAIL_MALFORMED_HTLC,
             HostedMessage::Error(_) => TAG_ERROR,
+            HostedMessage::PhcChannelUpdate(m) => m.tag,
         }
     }
 
     /// Encode to raw bytes: `u16 tag` + body.
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> EncodeResult<Bytes> {
         let mut buf = BytesMut::new();
         codecs::write_u16(&mut buf, self.tag());
         match self {
-            HostedMessage::InvokeHostedChannel(m) => m.encode(&mut buf),
-            HostedMessage::InitHostedChannel(m) => m.encode(&mut buf),
-            HostedMessage::LastCrossSignedState(m) => m.encode(&mut buf),
-            HostedMessage::StateUpdate(m) => m.encode(&mut buf),
-            HostedMessage::StateOverride(m) => m.encode(&mut buf),
-            HostedMessage::HostedChannelBranding(m) => m.encode(&mut buf),
-            HostedMessage::ResizeChannel(m) => m.encode(&mut buf),
-            HostedMessage::QueryPreimages(m) => m.encode(&mut buf),
-            HostedMessage::ReplyPreimages(m) => m.encode(&mut buf),
-            HostedMessage::AskBrandingInfo(m) => m.encode(&mut buf),
-            HostedMessage::UpdateAddHtlc(m) => m.encode(&mut buf),
-            HostedMessage::UpdateFulfillHtlc(m) => m.encode(&mut buf),
-            HostedMessage::UpdateFailHtlc(m) => m.encode(&mut buf),
-            HostedMessage::UpdateFailMalformedHtlc(m) => m.encode(&mut buf),
-            HostedMessage::Error(m) => m.encode(&mut buf),
+            HostedMessage::InvokeHostedChannel(m) => m.encode(&mut buf)?,
+            HostedMessage::InitHostedChannel(m) => m.encode(&mut buf)?,
+            HostedMessage::LastCrossSignedState(m) => m.encode(&mut buf)?,
+            HostedMessage::StateUpdate(m) => m.encode(&mut buf)?,
+            HostedMessage::StateOverride(m) => m.encode(&mut buf)?,
+            HostedMessage::HostedChannelBranding(m) => m.encode(&mut buf)?,
+            HostedMessage::AnnouncementSignature(m) => m.encode(&mut buf)?,
+            HostedMessage::ResizeChannel(m) => m.encode(&mut buf)?,
+            HostedMessage::QueryPublicHostedChannels(m) => m.encode(&mut buf)?,
+            HostedMessage::ReplyPublicHostedChannelsEnd(m) => m.encode(&mut buf)?,
+            HostedMessage::QueryPreimages(m) => m.encode(&mut buf)?,
+            HostedMessage::ReplyPreimages(m) => m.encode(&mut buf)?,
+            HostedMessage::AskBrandingInfo(m) => m.encode(&mut buf)?,
+            HostedMessage::UpdateAddHtlc(m) => m.encode(&mut buf)?,
+            HostedMessage::UpdateFulfillHtlc(m) => m.encode(&mut buf)?,
+            HostedMessage::UpdateFailHtlc(m) => m.encode(&mut buf)?,
+            HostedMessage::UpdateFailMalformedHtlc(m) => m.encode(&mut buf)?,
+            HostedMessage::Error(m) => m.encode(&mut buf)?,
+            HostedMessage::PhcChannelUpdate(m) => m.body.encode(&mut buf)?,
         }
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     /// Decode from raw bytes (without the tag — caller reads tag first,
@@ -114,7 +140,16 @@ impl HostedMessage {
             TAG_HOSTED_CHANNEL_BRANDING => {
                 HostedMessage::HostedChannelBranding(HostedChannelBranding::decode(buf)?)
             }
+            TAG_ANNOUNCEMENT_SIGNATURE => {
+                HostedMessage::AnnouncementSignature(AnnouncementSignature::decode(buf)?)
+            }
             TAG_RESIZE_CHANNEL => HostedMessage::ResizeChannel(ResizeChannel::decode(buf)?),
+            TAG_QUERY_PUBLIC_HOSTED_CHANNELS => {
+                HostedMessage::QueryPublicHostedChannels(QueryPublicHostedChannels::decode(buf)?)
+            }
+            TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END => HostedMessage::ReplyPublicHostedChannelsEnd(
+                ReplyPublicHostedChannelsEnd::decode(buf)?,
+            ),
             TAG_QUERY_PREIMAGES => HostedMessage::QueryPreimages(QueryPreimages::decode(buf)?),
             TAG_REPLY_PREIMAGES => HostedMessage::ReplyPreimages(ReplyPreimages::decode(buf)?),
             TAG_ASK_BRANDING_INFO => HostedMessage::AskBrandingInfo(AskBrandingInfo::decode(buf)?),
@@ -129,26 +164,17 @@ impl HostedMessage {
                 HostedMessage::UpdateFailMalformedHtlc(UpdateFailMalformedHtlc::decode_body(buf)?)
             }
             TAG_ERROR => HostedMessage::Error(HcError::decode(buf)?),
+            TAG_PHC_CHANNEL_UPDATE_GOSSIP | TAG_PHC_CHANNEL_UPDATE_SYNC => {
+                let body = ChannelUpdate::decode(buf)?;
+                HostedMessage::PhcChannelUpdate(PhcChannelUpdate { tag, body })
+            }
             _ => return Err(DecodeError::Invalid(format!("unknown tag {}", tag))),
         })
     }
 
     /// Decode from raw bytes that include the leading `u16 tag`.
+    /// Checks that no trailing bytes remain after the message body.
     pub fn decode(data: &[u8]) -> DecodeResult<Self> {
-        let mut buf: &[u8] = data;
-        let tag = codecs::read_u16(&mut buf)?;
-        Self::decode_with_tag(tag, &mut buf)
-    }
-
-    /// Decode standard bLIP-17 framing or the legacy `tag || len || body` framing.
-    pub fn decode_legacy_aware(data: &[u8]) -> DecodeResult<Self> {
-        match Self::decode_strict(data) {
-            Ok(msg) => Ok(msg),
-            Err(standard_err) => Self::decode_legacy(data).map_err(|_| standard_err),
-        }
-    }
-
-    fn decode_strict(data: &[u8]) -> DecodeResult<Self> {
         let mut buf: &[u8] = data;
         let tag = codecs::read_u16(&mut buf)?;
         let msg = Self::decode_with_tag(tag, &mut buf)?;
@@ -160,69 +186,127 @@ impl HostedMessage {
         }
         Ok(msg)
     }
+}
 
-    fn decode_legacy(data: &[u8]) -> DecodeResult<Self> {
-        let mut buf: &[u8] = data;
-        let tag = codecs::read_u16(&mut buf)?;
-        let len = codecs::read_u16(&mut buf)? as usize;
-        if buf.len() != len {
-            return Err(DecodeError::Invalid("legacy frame length mismatch".into()));
-        }
-        let msg = Self::decode_with_tag(tag, &mut buf)?;
-        if !buf.is_empty() {
+// ---------------------------------------------------------------------------
+// PHC ChannelUpdate (typed BOLT-7 channel_update body)
+// ---------------------------------------------------------------------------
+
+/// A typed BOLT-7 `channel_update` matching scoin's `channelUpdateCodec`.
+///
+/// This is the body carried by both PHC gossip tag `64509` and PHC sync
+/// tag `64507`, as well as standard BOLT-7 tag `258` (with the tag prepended).
+///
+/// ```text
+/// [64]  signature (compact ECDSA)
+/// [32]  chain_hash
+/// [8]   short_channel_id (int64 BE, no overflow check)
+/// [4]   timestamp (uint32)
+/// [1]   message_flags (constant 0x01)
+/// [1]   channel_flags
+/// [2]   cltv_expiry_delta (uint16)
+/// [8]   htlc_minimum_msat (uint64overflow)
+/// [4]   fee_base_msat (uint32)
+/// [4]   fee_proportional_millionths (uint32)
+/// [8]   htlc_maximum_msat (uint64overflow)
+/// [0+]  tlv_stream
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelUpdate {
+    pub signature: [u8; 64],
+    pub chain_hash: [u8; 32],
+    pub short_channel_id: u64,
+    pub timestamp: u32,
+    pub message_flags: u8,
+    pub channel_flags: u8,
+    pub cltv_expiry_delta: u16,
+    pub htlc_minimum_msat: u64,
+    pub fee_base_msat: u32,
+    pub fee_proportional_millionths: u32,
+    pub htlc_maximum_msat: u64,
+    pub tlv_stream: Bytes,
+}
+
+impl ChannelUpdate {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        write_signature(buf, &self.signature);
+        write_32(buf, &self.chain_hash);
+        write_u64(buf, self.short_channel_id);
+        write_u32(buf, self.timestamp);
+        codecs::write_u8(buf, self.message_flags);
+        codecs::write_u8(buf, self.channel_flags);
+        write_u16(buf, self.cltv_expiry_delta);
+        write_u64_overflow(buf, self.htlc_minimum_msat)?;
+        write_u32(buf, self.fee_base_msat);
+        write_u32(buf, self.fee_proportional_millionths);
+        write_u64_overflow(buf, self.htlc_maximum_msat)?;
+        codecs::write_bytes(buf, &self.tlv_stream);
+        Ok(())
+    }
+
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let signature = read_signature(buf)?;
+        let chain_hash = read_32(buf)?;
+        let short_channel_id = read_u64(buf)?;
+        let timestamp = read_u32(buf)?;
+        let message_flags = codecs::read_u8(buf)?;
+        if message_flags != 0x01 {
             return Err(DecodeError::Invalid(format!(
-                "{} trailing bytes after legacy message",
-                buf.len()
+                "channel_update message_flags must be 0x01, got {:#04x}",
+                message_flags
             )));
         }
-        Ok(msg)
+        let channel_flags = codecs::read_u8(buf)?;
+        let cltv_expiry_delta = read_u16(buf)?;
+        let htlc_minimum_msat = read_u64_overflow(buf)?;
+        let fee_base_msat = read_u32(buf)?;
+        let fee_proportional_millionths = read_u32(buf)?;
+        let htlc_maximum_msat = read_u64_overflow(buf)?;
+        let tlv_stream = codecs::read_remaining(buf);
+        validate_tlv_stream(&tlv_stream)?;
+        Ok(Self {
+            signature,
+            chain_hash,
+            short_channel_id,
+            timestamp,
+            message_flags,
+            channel_flags,
+            cltv_expiry_delta,
+            htlc_minimum_msat,
+            fee_base_msat,
+            fee_proportional_millionths,
+            htlc_maximum_msat,
+            tlv_stream,
+        })
+    }
+
+    /// The signed witness material (everything after the signature).
+    pub fn witness(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(72);
+        write_32(&mut buf, &self.chain_hash);
+        write_u64(&mut buf, self.short_channel_id);
+        write_u32(&mut buf, self.timestamp);
+        codecs::write_u8(&mut buf, self.message_flags);
+        codecs::write_u8(&mut buf, self.channel_flags);
+        write_u16(&mut buf, self.cltv_expiry_delta);
+        let _ = write_u64_overflow(&mut buf, self.htlc_minimum_msat);
+        write_u32(&mut buf, self.fee_base_msat);
+        write_u32(&mut buf, self.fee_proportional_millionths);
+        let _ = write_u64_overflow(&mut buf, self.htlc_maximum_msat);
+        codecs::write_bytes(&mut buf, &self.tlv_stream);
+        buf.freeze()
     }
 }
 
+/// A PHC-wrapped `channel_update` message.
+///
+/// Both `64509` (gossip) and `64507` (sync) carry the same typed
+/// `ChannelUpdate` body. We preserve the original tag so replies can
+/// match the peer's convention.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryPreimages {
-    pub hashes: Vec<[u8; 32]>,
-}
-
-impl QueryPreimages {
-    pub fn encode(&self, buf: &mut BytesMut) {
-        codecs::write_u16(buf, self.hashes.len() as u16);
-        for hash in &self.hashes {
-            write_32(buf, hash);
-        }
-    }
-
-    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
-        let count = codecs::read_u16(buf)? as usize;
-        let mut hashes = Vec::with_capacity(count);
-        for _ in 0..count {
-            hashes.push(read_32(buf)?);
-        }
-        Ok(Self { hashes })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplyPreimages {
-    pub preimages: Vec<[u8; 32]>,
-}
-
-impl ReplyPreimages {
-    pub fn encode(&self, buf: &mut BytesMut) {
-        codecs::write_u16(buf, self.preimages.len() as u16);
-        for preimage in &self.preimages {
-            write_32(buf, preimage);
-        }
-    }
-
-    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
-        let count = codecs::read_u16(buf)? as usize;
-        let mut preimages = Vec::with_capacity(count);
-        for _ in 0..count {
-            preimages.push(read_32(buf)?);
-        }
-        Ok(Self { preimages })
-    }
+pub struct PhcChannelUpdate {
+    pub tag: u16,
+    pub body: ChannelUpdate,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,10 +322,11 @@ pub struct InvokeHostedChannel {
 }
 
 impl InvokeHostedChannel {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         codecs::write_32(buf, &self.chain_hash);
-        codecs::write_varsize(buf, &self.refund_scriptpubkey);
-        codecs::write_varsize(buf, &self.secret);
+        write_varsize(buf, &self.refund_scriptpubkey)?;
+        write_varsize(buf, &self.secret)?;
+        Ok(())
     }
 
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
@@ -263,11 +348,12 @@ pub struct StateUpdate {
 }
 
 impl StateUpdate {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         write_u32(buf, self.block_day);
         write_u32(buf, self.local_updates);
         write_u32(buf, self.remote_updates);
         write_signature(buf, &self.local_sig_of_remote);
+        Ok(())
     }
 
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
@@ -291,21 +377,82 @@ pub struct StateOverride {
 }
 
 impl StateOverride {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         write_u32(buf, self.block_day);
-        write_u64(buf, self.local_balance_msat);
+        write_u64_overflow(buf, self.local_balance_msat)?;
         write_u32(buf, self.local_updates);
         write_u32(buf, self.remote_updates);
         write_signature(buf, &self.local_sig_of_remote);
+        Ok(())
     }
 
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
         Ok(Self {
             block_day: read_u32(buf)?,
-            local_balance_msat: read_u64(buf)?,
+            local_balance_msat: read_u64_overflow(buf)?,
             local_updates: read_u32(buf)?,
             remote_updates: read_u32(buf)?,
             local_sig_of_remote: read_signature(buf)?,
+        })
+    }
+}
+
+/// `announcement_signature` (65523) — PHC announcement signature request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnouncementSignature {
+    pub node_signature: [u8; 64],
+    pub wants_reply: bool,
+}
+
+impl AnnouncementSignature {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        write_signature(buf, &self.node_signature);
+        codecs::write_bool(buf, self.wants_reply);
+        Ok(())
+    }
+
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        Ok(Self {
+            node_signature: read_signature(buf)?,
+            wants_reply: codecs::read_bool(buf)?,
+        })
+    }
+}
+
+/// `query_public_hosted_channels` (65519)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryPublicHostedChannels {
+    pub chain_hash: [u8; 32],
+}
+
+impl QueryPublicHostedChannels {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        codecs::write_32(buf, &self.chain_hash);
+        Ok(())
+    }
+
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        Ok(Self {
+            chain_hash: read_32(buf)?,
+        })
+    }
+}
+
+/// `reply_public_hosted_channels_end` (65517)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyPublicHostedChannelsEnd {
+    pub chain_hash: [u8; 32],
+}
+
+impl ReplyPublicHostedChannelsEnd {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        codecs::write_32(buf, &self.chain_hash);
+        Ok(())
+    }
+
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        Ok(Self {
+            chain_hash: read_32(buf)?,
         })
     }
 }
@@ -316,6 +463,18 @@ pub struct AskBrandingInfo {
     pub chain_hash: [u8; 32],
 }
 
+impl AskBrandingInfo {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        codecs::write_32(buf, &self.chain_hash);
+        Ok(())
+    }
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        Ok(Self {
+            chain_hash: read_32(buf)?,
+        })
+    }
+}
+
 /// Poncho extension `resize_channel` (65521).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResizeChannel {
@@ -324,14 +483,15 @@ pub struct ResizeChannel {
 }
 
 impl ResizeChannel {
-    pub fn encode(&self, buf: &mut BytesMut) {
-        write_u64(buf, self.new_capacity_sat);
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        write_u64_overflow(buf, self.new_capacity_sat)?;
         write_signature(buf, &self.client_sig);
+        Ok(())
     }
 
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
         Ok(Self {
-            new_capacity_sat: read_u64(buf)?,
+            new_capacity_sat: read_u64_overflow(buf)?,
             client_sig: read_signature(buf)?,
         })
     }
@@ -353,18 +513,10 @@ impl ResizeChannel {
     }
 }
 
-impl AskBrandingInfo {
-    pub fn encode(&self, buf: &mut BytesMut) {
-        codecs::write_32(buf, &self.chain_hash);
-    }
-    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
-        Ok(Self {
-            chain_hash: read_32(buf)?,
-        })
-    }
-}
-
 /// `hosted_channel_branding` (65525)
+///
+/// `contact_info` is stored as `Bytes` but validated as UTF-8 on
+/// encode/decode, matching scoin's `variableSizeBytes(uint16, utf8)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostedChannelBranding {
     pub rgb_color: [u8; 3],
@@ -373,23 +525,27 @@ pub struct HostedChannelBranding {
 }
 
 impl HostedChannelBranding {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         buf.extend_from_slice(&self.rgb_color);
         match &self.png_icon {
             Some(png) => {
                 codecs::write_u8(buf, 1);
-                write_varsize(buf, png);
+                write_varsize(buf, png)?;
             }
             None => {
                 codecs::write_u8(buf, 0);
             }
         }
-        write_varsize(buf, &self.contact_info);
+        if std::str::from_utf8(&self.contact_info).is_err() {
+            return Err(EncodeError::InvalidUtf8("contact_info is not valid UTF-8".into()));
+        }
+        write_varsize(buf, &self.contact_info)?;
+        Ok(())
     }
 
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
         let mut rgb = [0u8; 3];
-        let raw = codecs::read_bytes(buf, 3)?;
+        let raw = read_bytes(buf, 3)?;
         rgb.copy_from_slice(&raw);
         let has_png = codecs::read_u8(buf)? != 0;
         let png_icon = if has_png {
@@ -398,6 +554,11 @@ impl HostedChannelBranding {
             None
         };
         let contact_info = read_varsize(buf)?;
+        if std::str::from_utf8(&contact_info).is_err() {
+            return Err(DecodeError::Invalid(
+                "hosted_channel_branding contact_info is not valid UTF-8".into(),
+            ));
+        }
         Ok(Self {
             rgb_color: rgb,
             png_icon,
@@ -408,8 +569,8 @@ impl HostedChannelBranding {
 
 /// `update_add_htlc` (63505) — full scoin/BOLT-2 body with 32-byte channel_id.
 impl UpdateAddHtlc {
-    pub fn encode(&self, buf: &mut BytesMut) {
-        codecs::encode_update_add_htlc_body(buf, self);
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        codecs::encode_update_add_htlc_body(buf, self)
     }
     pub fn decode_body(buf: &mut &[u8]) -> DecodeResult<Self> {
         codecs::decode_update_add_htlc_body(buf)
@@ -422,19 +583,28 @@ pub struct UpdateFulfillHtlc {
     pub channel_id: [u8; 32],
     pub id: u64,
     pub payment_preimage: [u8; 32],
+    pub tlv_stream: Bytes,
 }
 
 impl UpdateFulfillHtlc {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         write_32(buf, &self.channel_id);
-        write_u64(buf, self.id);
+        write_u64_overflow(buf, self.id)?;
         write_32(buf, &self.payment_preimage);
+        codecs::write_bytes(buf, &self.tlv_stream);
+        Ok(())
     }
     pub fn decode_body(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let channel_id = read_32(buf)?;
+        let id = read_u64_overflow(buf)?;
+        let payment_preimage = read_32(buf)?;
+        let tlv_stream = codecs::read_remaining(buf);
+        validate_tlv_stream(&tlv_stream)?;
         Ok(Self {
-            channel_id: read_32(buf)?,
-            id: read_u64(buf)?,
-            payment_preimage: read_32(buf)?,
+            channel_id,
+            id,
+            payment_preimage,
+            tlv_stream,
         })
     }
 }
@@ -445,19 +615,28 @@ pub struct UpdateFailHtlc {
     pub channel_id: [u8; 32],
     pub id: u64,
     pub reason: Bytes,
+    pub tlv_stream: Bytes,
 }
 
 impl UpdateFailHtlc {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         write_32(buf, &self.channel_id);
-        write_u64(buf, self.id);
-        write_varsize(buf, &self.reason);
+        write_u64_overflow(buf, self.id)?;
+        write_varsize(buf, &self.reason)?;
+        codecs::write_bytes(buf, &self.tlv_stream);
+        Ok(())
     }
     pub fn decode_body(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let channel_id = read_32(buf)?;
+        let id = read_u64_overflow(buf)?;
+        let reason = read_varsize(buf)?;
+        let tlv_stream = codecs::read_remaining(buf);
+        validate_tlv_stream(&tlv_stream)?;
         Ok(Self {
-            channel_id: read_32(buf)?,
-            id: read_u64(buf)?,
-            reason: read_varsize(buf)?,
+            channel_id,
+            id,
+            reason,
+            tlv_stream,
         })
     }
 }
@@ -469,42 +648,112 @@ pub struct UpdateFailMalformedHtlc {
     pub id: u64,
     pub sha256_of_onion: [u8; 32],
     pub failure_code: u16,
+    pub tlv_stream: Bytes,
 }
 
 impl UpdateFailMalformedHtlc {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         write_32(buf, &self.channel_id);
-        write_u64(buf, self.id);
+        write_u64_overflow(buf, self.id)?;
         write_32(buf, &self.sha256_of_onion);
         codecs::write_u16(buf, self.failure_code);
+        codecs::write_bytes(buf, &self.tlv_stream);
+        Ok(())
     }
     pub fn decode_body(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let channel_id = read_32(buf)?;
+        let id = read_u64_overflow(buf)?;
+        let sha256_of_onion = read_32(buf)?;
+        let failure_code = read_u16(buf)?;
+        let tlv_stream = codecs::read_remaining(buf);
+        validate_tlv_stream(&tlv_stream)?;
         Ok(Self {
-            channel_id: read_32(buf)?,
-            id: read_u64(buf)?,
-            sha256_of_onion: read_32(buf)?,
-            failure_code: codecs::read_u16(buf)?,
+            channel_id,
+            id,
+            sha256_of_onion,
+            failure_code,
+            tlv_stream,
         })
     }
 }
 
-/// `error` (63497) — matches scoin's errorCodec: channelId + varsize data.
+/// `error` (63497) — matches scoin's errorCodec: channelId + varsize data + tlv_stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HcError {
     pub channel_id: [u8; 32],
     pub data: Bytes,
+    pub tlv_stream: Bytes,
 }
 
 impl HcError {
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
         codecs::write_32(buf, &self.channel_id);
-        codecs::write_varsize(buf, &self.data);
+        write_varsize(buf, &self.data)?;
+        codecs::write_bytes(buf, &self.tlv_stream);
+        Ok(())
     }
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let channel_id = read_32(buf)?;
+        let data = read_varsize(buf)?;
+        let tlv_stream = codecs::read_remaining(buf);
+        validate_tlv_stream(&tlv_stream)?;
         Ok(Self {
-            channel_id: read_32(buf)?,
-            data: read_varsize(buf)?,
+            channel_id,
+            data,
+            tlv_stream,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preimages
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryPreimages {
+    pub hashes: Vec<[u8; 32]>,
+}
+
+impl QueryPreimages {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        codecs::write_u16(buf, self.hashes.len() as u16);
+        for hash in &self.hashes {
+            write_32(buf, hash);
+        }
+        Ok(())
+    }
+
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let count = codecs::read_u16(buf)? as usize;
+        let mut hashes = Vec::with_capacity(count);
+        for _ in 0..count {
+            hashes.push(read_32(buf)?);
+        }
+        Ok(Self { hashes })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyPreimages {
+    pub preimages: Vec<[u8; 32]>,
+}
+
+impl ReplyPreimages {
+    pub fn encode(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        codecs::write_u16(buf, self.preimages.len() as u16);
+        for preimage in &self.preimages {
+            write_32(buf, preimage);
+        }
+        Ok(())
+    }
+
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let count = codecs::read_u16(buf)? as usize;
+        let mut preimages = Vec::with_capacity(count);
+        for _ in 0..count {
+            preimages.push(read_32(buf)?);
+        }
+        Ok(Self { preimages })
     }
 }
 
@@ -520,7 +769,7 @@ mod tests {
             secret: Bytes::from_static(b"my-secret"),
         };
         let mut buf = BytesMut::new();
-        msg.encode(&mut buf);
+        msg.encode(&mut buf).unwrap();
         let mut slice = &buf[..];
         let dec = InvokeHostedChannel::decode(&mut slice).unwrap();
         assert_eq!(dec, msg);
@@ -528,33 +777,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_framed_invoke_decodes() {
-        let msg = HostedMessage::InvokeHostedChannel(InvokeHostedChannel {
-            chain_hash: [1u8; 32],
-            refund_scriptpubkey: Bytes::from_static(&[0x00, 0x14]),
-            secret: Bytes::from_static(b"secret"),
-        });
-        let encoded = msg.encode();
-        let body_len = encoded.len() - 2;
-        let mut legacy = BytesMut::new();
-        codecs::write_u16(&mut legacy, msg.tag());
-        codecs::write_u16(&mut legacy, body_len as u16);
-        legacy.extend_from_slice(&encoded[2..]);
-
-        let decoded = HostedMessage::decode_legacy_aware(&legacy).unwrap();
-
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
     fn strict_decode_rejects_trailing_bytes() {
         let msg = HostedMessage::AskBrandingInfo(AskBrandingInfo {
             chain_hash: [0; 32],
         });
-        let mut encoded = msg.encode().to_vec();
+        let mut encoded = msg.encode().unwrap().to_vec();
         encoded.push(0);
 
-        assert!(HostedMessage::decode_legacy_aware(&encoded).is_err());
+        assert!(HostedMessage::decode(&encoded).is_err());
     }
 
     #[test]
@@ -566,7 +796,7 @@ mod tests {
             local_sig_of_remote: [0xAB; 64],
         };
         let mut buf = BytesMut::new();
-        msg.encode(&mut buf);
+        msg.encode(&mut buf).unwrap();
         let mut slice = &buf[..];
         let dec = StateUpdate::decode(&mut slice).unwrap();
         assert_eq!(dec, msg);
@@ -582,9 +812,49 @@ mod tests {
             local_sig_of_remote: [0xAB; 64],
         };
         let mut buf = BytesMut::new();
-        msg.encode(&mut buf);
+        msg.encode(&mut buf).unwrap();
         let mut slice = &buf[..];
         let dec = StateOverride::decode(&mut slice).unwrap();
+        assert_eq!(dec, msg);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn announcement_signature_roundtrip() {
+        let msg = AnnouncementSignature {
+            node_signature: [0xCD; 64],
+            wants_reply: true,
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let mut slice = &buf[..];
+        let dec = AnnouncementSignature::decode(&mut slice).unwrap();
+        assert_eq!(dec, msg);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn query_public_hosted_channels_roundtrip() {
+        let msg = QueryPublicHostedChannels {
+            chain_hash: [0x42; 32],
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let mut slice = &buf[..];
+        let dec = QueryPublicHostedChannels::decode(&mut slice).unwrap();
+        assert_eq!(dec, msg);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn reply_public_hosted_channels_end_roundtrip() {
+        let msg = ReplyPublicHostedChannelsEnd {
+            chain_hash: [0x42; 32],
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let mut slice = &buf[..];
+        let dec = ReplyPublicHostedChannelsEnd::decode(&mut slice).unwrap();
         assert_eq!(dec, msg);
         assert!(slice.is_empty());
     }
@@ -614,7 +884,7 @@ mod tests {
             remote_sig_of_local: [0; 64],
             local_sig_of_remote: [0; 64],
         };
-        lcss.sign(&sk);
+        lcss.sign(&sk).unwrap();
 
         let messages = vec![
             HostedMessage::InvokeHostedChannel(InvokeHostedChannel {
@@ -637,7 +907,17 @@ mod tests {
                 remote_updates: 1,
                 local_sig_of_remote: [0; 64],
             }),
+            HostedMessage::AnnouncementSignature(AnnouncementSignature {
+                node_signature: [0; 64],
+                wants_reply: false,
+            }),
             HostedMessage::AskBrandingInfo(AskBrandingInfo {
+                chain_hash: [2; 32],
+            }),
+            HostedMessage::QueryPublicHostedChannels(QueryPublicHostedChannels {
+                chain_hash: [2; 32],
+            }),
+            HostedMessage::ReplyPublicHostedChannelsEnd(ReplyPublicHostedChannelsEnd {
                 chain_hash: [2; 32],
             }),
             HostedMessage::HostedChannelBranding(HostedChannelBranding {
@@ -657,31 +937,36 @@ mod tests {
                 payment_hash: [3; 32],
                 cltv_expiry: 700_000,
                 onion_routing_packet: Bytes::from(vec![0; codecs::ONION_ROUTING_PACKET_SIZE]),
+                tlv_stream: Bytes::new(),
             }),
             HostedMessage::UpdateFulfillHtlc(UpdateFulfillHtlc {
                 channel_id: [0x42; 32],
                 id: 1,
                 payment_preimage: [4; 32],
+                tlv_stream: Bytes::new(),
             }),
             HostedMessage::UpdateFailHtlc(UpdateFailHtlc {
                 channel_id: [0x42; 32],
                 id: 1,
                 reason: Bytes::from_static(b"fail"),
+                tlv_stream: Bytes::new(),
             }),
             HostedMessage::UpdateFailMalformedHtlc(UpdateFailMalformedHtlc {
                 channel_id: [0x42; 32],
                 id: 1,
                 sha256_of_onion: [5; 32],
                 failure_code: 0x4000,
+                tlv_stream: Bytes::new(),
             }),
             HostedMessage::Error(HcError {
                 channel_id: [6; 32],
                 data: Bytes::from_static(b"err"),
+                tlv_stream: Bytes::new(),
             }),
         ];
 
         for msg in &messages {
-            let encoded = msg.encode();
+            let encoded = msg.encode().unwrap();
             let decoded = HostedMessage::decode(&encoded).unwrap();
             assert_eq!(&decoded, msg, "roundtrip failed for {:?}", msg.tag());
         }
@@ -695,7 +980,7 @@ mod tests {
             contact_info: Bytes::from_static(b"https://x.com"),
         };
         let mut buf = BytesMut::new();
-        with_png.encode(&mut buf);
+        with_png.encode(&mut buf).unwrap();
         let mut slice = &buf[..];
         let dec = HostedChannelBranding::decode(&mut slice).unwrap();
         assert_eq!(dec, with_png);
@@ -706,9 +991,182 @@ mod tests {
             contact_info: Bytes::from_static(b"https://y.com"),
         };
         buf.clear();
-        without_png.encode(&mut buf);
+        without_png.encode(&mut buf).unwrap();
         let mut slice = &buf[..];
         let dec = HostedChannelBranding::decode(&mut slice).unwrap();
         assert_eq!(dec, without_png);
+    }
+
+    #[test]
+    fn branding_rejects_non_utf8_contact_info() {
+        let mut buf = BytesMut::new();
+        let bad = HostedChannelBranding {
+            rgb_color: [0, 0, 0],
+            png_icon: None,
+            contact_info: Bytes::from_static(&[0xFF, 0xFE, 0xFD]),
+        };
+        assert!(bad.encode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn channel_update_roundtrip() {
+        let cu = ChannelUpdate {
+            signature: [0xAA; 64],
+            chain_hash: [0x42; 32],
+            short_channel_id: 123456789,
+            timestamp: 1_700_000_000,
+            message_flags: 0x01,
+            channel_flags: 0x00,
+            cltv_expiry_delta: 144,
+            htlc_minimum_msat: 1_000,
+            fee_base_msat: 1_000,
+            fee_proportional_millionths: 100,
+            htlc_maximum_msat: 100_000_000,
+            tlv_stream: Bytes::new(),
+        };
+        let mut buf = BytesMut::new();
+        cu.encode(&mut buf).unwrap();
+        let mut slice: &[u8] = &buf;
+        let dec = ChannelUpdate::decode(&mut slice).unwrap();
+        assert_eq!(dec, cu);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn phc_channel_update_64507_roundtrip() {
+        let cu = ChannelUpdate {
+            signature: [0xAA; 64],
+            chain_hash: [0x42; 32],
+            short_channel_id: 999,
+            timestamp: 42,
+            message_flags: 0x01,
+            channel_flags: 0x01,
+            cltv_expiry_delta: 144,
+            htlc_minimum_msat: 1_000,
+            fee_base_msat: 1_000,
+            fee_proportional_millionths: 100,
+            htlc_maximum_msat: 100_000_000,
+            tlv_stream: Bytes::new(),
+        };
+        let msg = HostedMessage::PhcChannelUpdate(PhcChannelUpdate {
+            tag: TAG_PHC_CHANNEL_UPDATE_SYNC,
+            body: cu,
+        });
+        let encoded = msg.encode().unwrap();
+        let decoded = HostedMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn phc_channel_update_64509_roundtrip() {
+        let cu = ChannelUpdate {
+            signature: [0xBB; 64],
+            chain_hash: [0x42; 32],
+            short_channel_id: 888,
+            timestamp: 99,
+            message_flags: 0x01,
+            channel_flags: 0x00,
+            cltv_expiry_delta: 144,
+            htlc_minimum_msat: 1_000,
+            fee_base_msat: 1_000,
+            fee_proportional_millionths: 100,
+            htlc_maximum_msat: 100_000_000,
+            tlv_stream: Bytes::new(),
+        };
+        let msg = HostedMessage::PhcChannelUpdate(PhcChannelUpdate {
+            tag: TAG_PHC_CHANNEL_UPDATE_GOSSIP,
+            body: cu,
+        });
+        let encoded = msg.encode().unwrap();
+        let decoded = HostedMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn update_add_htlc_with_tlv_stream_preserves_bytes() {
+        let tlv = Bytes::from_static(&[0x01, 0x02, 0xAA, 0xBB]);
+        let htlc = UpdateAddHtlc {
+            channel_id: [0x42; 32],
+            id: 7,
+            amount_msat: 500_000,
+            payment_hash: [0x99; 32],
+            cltv_expiry: 700_000,
+            onion_routing_packet: Bytes::from(vec![0; codecs::ONION_ROUTING_PACKET_SIZE]),
+            tlv_stream: tlv.clone(),
+        };
+        let mut buf = BytesMut::new();
+        codecs::encode_update_add_htlc_body(&mut buf, &htlc).unwrap();
+        let mut slice: &[u8] = &buf;
+        let decoded = codecs::decode_update_add_htlc_body(&mut slice).unwrap();
+        assert_eq!(decoded.tlv_stream, tlv);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn update_fulfill_htlc_with_tlv_preserves_bytes() {
+        let tlv = Bytes::from_static(&[0x03, 0x02, 0xBB, 0xCC]);
+        let msg = UpdateFulfillHtlc {
+            channel_id: [0x42; 32],
+            id: 1,
+            payment_preimage: [4; 32],
+            tlv_stream: tlv.clone(),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let mut slice: &[u8] = &buf;
+        let decoded = UpdateFulfillHtlc::decode_body(&mut slice).unwrap();
+        assert_eq!(decoded.tlv_stream, tlv);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn update_fail_htlc_with_tlv_preserves_bytes() {
+        let tlv = Bytes::from_static(&[0x05, 0x01, 0xDD]);
+        let msg = UpdateFailHtlc {
+            channel_id: [0x42; 32],
+            id: 1,
+            reason: Bytes::from_static(b"fail"),
+            tlv_stream: tlv.clone(),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let mut slice: &[u8] = &buf;
+        let decoded = UpdateFailHtlc::decode_body(&mut slice).unwrap();
+        assert_eq!(decoded.tlv_stream, tlv);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn update_fail_malformed_htlc_with_tlv_preserves_bytes() {
+        let tlv = Bytes::from_static(&[0x07, 0x01, 0xEE]);
+        let msg = UpdateFailMalformedHtlc {
+            channel_id: [0x42; 32],
+            id: 1,
+            sha256_of_onion: [5; 32],
+            failure_code: 0x4000,
+            tlv_stream: tlv.clone(),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let mut slice: &[u8] = &buf;
+        let decoded = UpdateFailMalformedHtlc::decode_body(&mut slice).unwrap();
+        assert_eq!(decoded.tlv_stream, tlv);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn hc_error_with_tlv_preserves_bytes() {
+        let tlv = Bytes::from_static(&[0x09, 0x02, 0xFF, 0x00]);
+        let msg = HcError {
+            channel_id: [6; 32],
+            data: Bytes::from_static(b"err"),
+            tlv_stream: tlv.clone(),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let mut slice: &[u8] = &buf;
+        let decoded = HcError::decode(&mut slice).unwrap();
+        assert_eq!(decoded.tlv_stream, tlv);
+        assert!(slice.is_empty());
     }
 }

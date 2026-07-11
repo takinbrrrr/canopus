@@ -116,6 +116,7 @@ impl HtlcManager {
             payment_hash,
             cltv_expiry,
             onion_routing_packet: onion,
+            tlv_stream: Bytes::new(),
         };
 
         match self

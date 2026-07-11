@@ -614,7 +614,7 @@ mod handler {
             .ok_or_else(|| anyhow::anyhow!("custommsg missing message"))?;
         let peer_id = parse_peer(peer_id)?;
         let bytes = hex::decode(message)?;
-        let msg = match HostedMessage::decode_legacy_aware(&bytes) {
+        let msg = match HostedMessage::decode(&bytes) {
             Ok(msg) => msg,
             Err(_) => return Ok(json!({ "result": "continue" })),
         };
@@ -646,7 +646,11 @@ mod handler {
             }
             HostedMessage::StateOverride(_)
             | HostedMessage::InitHostedChannel(_)
-            | HostedMessage::HostedChannelBranding(_) => {}
+            | HostedMessage::HostedChannelBranding(_)
+            | HostedMessage::AnnouncementSignature(_)
+            | HostedMessage::QueryPublicHostedChannels(_)
+            | HostedMessage::ReplyPublicHostedChannelsEnd(_)
+            | HostedMessage::PhcChannelUpdate(_) => {}
         }
         Ok(json!({ "result": "handled" }))
     }
@@ -727,6 +731,7 @@ mod handler {
             payment_hash,
             cltv_expiry,
             onion_routing_packet: Bytes::from(hex::decode(next_onion)?),
+            tlv_stream: Bytes::new(),
         };
         controller
             .channel_handle_htlc_add(

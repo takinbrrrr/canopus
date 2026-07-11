@@ -95,7 +95,7 @@ async fn establish_channel(
         remote_sig_of_local: [0; 64],
         local_sig_of_remote: [0; 64],
     };
-    client_lcss.sign(client_secret);
+    client_lcss.sign(client_secret).unwrap();
 
     // Client sends state_update
     controller
@@ -184,7 +184,7 @@ async fn test_channel_with_secret() {
         remote_sig_of_local: [0; 64],
         local_sig_of_remote: [0; 64],
     };
-    client_lcss.sign(&client_secret);
+    client_lcss.sign(&client_secret).unwrap();
 
     controller
         .handle_state_update(
@@ -281,6 +281,7 @@ async fn test_error_and_reset() {
     let err = HcError {
         channel_id: [0; 32],
         data: Bytes::from_static(b"test error from peer"),
+        tlv_stream: Bytes::new(),
     };
     controller.handle_error(&client_public, err).await.unwrap();
 
@@ -314,7 +315,7 @@ async fn test_error_and_reset() {
         .unwrap();
 
     let mut accepted = override_lcss.reverse();
-    accepted.sign(&client_secret);
+    accepted.sign(&client_secret).unwrap();
 
     controller
         .handle_state_update(
@@ -410,6 +411,7 @@ async fn test_htlc_add_to_active_channel() {
         payment_hash: hash_arr,
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
     };
 
     // The controller should add the HTLC and send update_add_htlc to client
@@ -453,6 +455,7 @@ async fn test_hosted_fail_wraps_upstream_failure() {
         payment_hash: [7; 32],
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
     };
     controller
         .channel_handle_htlc_add(&client_public, htlc, "9/42", 9, 42, Some([3; 32]))
@@ -467,6 +470,7 @@ async fn test_hosted_fail_wraps_upstream_failure() {
                 channel_id: [0u8; 32],
                 id: 1,
                 reason: Bytes::from_static(&[0x10, 0x07]),
+                tlv_stream: Bytes::new(),
             },
         )
         .await
@@ -614,6 +618,7 @@ async fn test_htlc_resolution_with_known_preimage() {
         payment_hash: hash_arr,
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
     };
 
     controller
