@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use cln_rpc::ClnRpc;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -47,6 +47,28 @@ impl ClnStore {
         }
     }
 
+    fn datastore_params(
+        key: &[&str],
+        hex: Option<String>,
+        mode: &str,
+        generation: Option<u64>,
+    ) -> Value {
+        let mut params = json!({
+            "key": Self::key_vec(key),
+            "mode": mode,
+        });
+        let Value::Object(ref mut object) = params else {
+            unreachable!("datastore params are always an object")
+        };
+        if let Some(hex) = hex {
+            object.insert("hex".to_string(), Value::String(hex));
+        }
+        if let Some(generation) = generation {
+            object.insert("generation".to_string(), Value::from(generation));
+        }
+        params
+    }
+
     async fn datastore_call(
         &self,
         key: &[&str],
@@ -54,12 +76,7 @@ impl ClnStore {
         mode: &str,
         generation: Option<u64>,
     ) -> StoreResult<serde_json::Value> {
-        let params = json!({
-            "key": Self::key_vec(key),
-            "hex": hex,
-            "mode": mode,
-            "generation": generation,
-        });
+        let params = Self::datastore_params(key, hex, mode, generation);
         let mut rpc = self.rpc.lock().await;
         rpc.call_raw("datastore", &params)
             .await
@@ -189,5 +206,66 @@ impl Store for ClnStore {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClnStore;
+    use serde_json::json;
+
+    #[test]
+    fn create_params_omit_generation() {
+        let params = ClnStore::datastore_params(
+            &["canopusd", "channels", "peer"],
+            Some("00ff".to_string()),
+            "must-create",
+            None,
+        );
+
+        assert_eq!(
+            params,
+            json!({
+                "key": ["canopusd", "channels", "peer"],
+                "hex": "00ff",
+                "mode": "must-create",
+            })
+        );
+        assert!(params.get("generation").is_none());
+    }
+
+    #[test]
+    fn update_params_include_generation() {
+        let params = ClnStore::datastore_params(
+            &["canopusd", "channels", "peer"],
+            Some("00ff".to_string()),
+            "must-replace",
+            Some(42),
+        );
+
+        assert_eq!(
+            params,
+            json!({
+                "key": ["canopusd", "channels", "peer"],
+                "hex": "00ff",
+                "mode": "must-replace",
+                "generation": 42,
+            })
+        );
+    }
+
+    #[test]
+    fn optional_datastore_params_are_omitted() {
+        let params = ClnStore::datastore_params(&["canopusd", "key"], None, "must-create", None);
+
+        assert_eq!(
+            params,
+            json!({
+                "key": ["canopusd", "key"],
+                "mode": "must-create",
+            })
+        );
+        assert!(params.get("hex").is_none());
+        assert!(params.get("generation").is_none());
     }
 }

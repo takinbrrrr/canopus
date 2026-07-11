@@ -9,11 +9,23 @@ pub mod lcss;
 
 use self::codecs::{
     read_32, read_bytes, read_signature, read_u16, read_u32, read_u64, read_u64_overflow,
-    read_varsize, validate_tlv_stream, write_32, write_signature, write_u16, write_u32,
-    write_u64, write_u64_overflow, write_varsize, DecodeError, DecodeResult, EncodeError,
-    EncodeResult, UpdateAddHtlc,
+    read_varsize, validate_tlv_stream, write_32, write_signature, write_u16, write_u32, write_u64,
+    write_u64_overflow, write_varsize, DecodeError, DecodeResult, EncodeError, EncodeResult,
+    UpdateAddHtlc,
 };
 use bytes::{Bytes, BytesMut};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireEncoding {
+    Strict,
+    Legacy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedHostedMessage {
+    pub message: HostedMessage,
+    pub encoding: WireEncoding,
+}
 
 // Message type tags (from bLIP-17)
 pub const TAG_INVOKE_HOSTED_CHANNEL: u16 = 65535;
@@ -79,9 +91,7 @@ impl HostedMessage {
             HostedMessage::AnnouncementSignature(_) => TAG_ANNOUNCEMENT_SIGNATURE,
             HostedMessage::ResizeChannel(_) => TAG_RESIZE_CHANNEL,
             HostedMessage::QueryPublicHostedChannels(_) => TAG_QUERY_PUBLIC_HOSTED_CHANNELS,
-            HostedMessage::ReplyPublicHostedChannelsEnd(_) => {
-                TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END
-            }
+            HostedMessage::ReplyPublicHostedChannelsEnd(_) => TAG_REPLY_PUBLIC_HOSTED_CHANNELS_END,
             HostedMessage::QueryPreimages(_) => TAG_QUERY_PREIMAGES,
             HostedMessage::ReplyPreimages(_) => TAG_REPLY_PREIMAGES,
             HostedMessage::AskBrandingInfo(_) => TAG_ASK_BRANDING_INFO,
@@ -96,30 +106,48 @@ impl HostedMessage {
 
     /// Encode to raw bytes: `u16 tag` + body.
     pub fn encode(&self) -> EncodeResult<Bytes> {
+        self.encode_with_encoding(WireEncoding::Strict)
+    }
+
+    /// Encode to raw bytes using either strict `tag || body` or legacy
+    /// `tag || u16_len || body` framing.
+    pub fn encode_with_encoding(&self, encoding: WireEncoding) -> EncodeResult<Bytes> {
         let mut buf = BytesMut::new();
         codecs::write_u16(&mut buf, self.tag());
-        match self {
-            HostedMessage::InvokeHostedChannel(m) => m.encode(&mut buf)?,
-            HostedMessage::InitHostedChannel(m) => m.encode(&mut buf)?,
-            HostedMessage::LastCrossSignedState(m) => m.encode(&mut buf)?,
-            HostedMessage::StateUpdate(m) => m.encode(&mut buf)?,
-            HostedMessage::StateOverride(m) => m.encode(&mut buf)?,
-            HostedMessage::HostedChannelBranding(m) => m.encode(&mut buf)?,
-            HostedMessage::AnnouncementSignature(m) => m.encode(&mut buf)?,
-            HostedMessage::ResizeChannel(m) => m.encode(&mut buf)?,
-            HostedMessage::QueryPublicHostedChannels(m) => m.encode(&mut buf)?,
-            HostedMessage::ReplyPublicHostedChannelsEnd(m) => m.encode(&mut buf)?,
-            HostedMessage::QueryPreimages(m) => m.encode(&mut buf)?,
-            HostedMessage::ReplyPreimages(m) => m.encode(&mut buf)?,
-            HostedMessage::AskBrandingInfo(m) => m.encode(&mut buf)?,
-            HostedMessage::UpdateAddHtlc(m) => m.encode(&mut buf)?,
-            HostedMessage::UpdateFulfillHtlc(m) => m.encode(&mut buf)?,
-            HostedMessage::UpdateFailHtlc(m) => m.encode(&mut buf)?,
-            HostedMessage::UpdateFailMalformedHtlc(m) => m.encode(&mut buf)?,
-            HostedMessage::Error(m) => m.encode(&mut buf)?,
-            HostedMessage::PhcChannelUpdate(m) => m.body.encode(&mut buf)?,
+        match encoding {
+            WireEncoding::Strict => self.encode_body(&mut buf)?,
+            WireEncoding::Legacy => {
+                let mut body = BytesMut::new();
+                self.encode_body(&mut body)?;
+                write_varsize(&mut buf, &body)?;
+            }
         }
         Ok(buf.freeze())
+    }
+
+    fn encode_body(&self, buf: &mut BytesMut) -> EncodeResult<()> {
+        match self {
+            HostedMessage::InvokeHostedChannel(m) => m.encode(buf)?,
+            HostedMessage::InitHostedChannel(m) => m.encode(buf)?,
+            HostedMessage::LastCrossSignedState(m) => m.encode(buf)?,
+            HostedMessage::StateUpdate(m) => m.encode(buf)?,
+            HostedMessage::StateOverride(m) => m.encode(buf)?,
+            HostedMessage::HostedChannelBranding(m) => m.encode(buf)?,
+            HostedMessage::AnnouncementSignature(m) => m.encode(buf)?,
+            HostedMessage::ResizeChannel(m) => m.encode(buf)?,
+            HostedMessage::QueryPublicHostedChannels(m) => m.encode(buf)?,
+            HostedMessage::ReplyPublicHostedChannelsEnd(m) => m.encode(buf)?,
+            HostedMessage::QueryPreimages(m) => m.encode(buf)?,
+            HostedMessage::ReplyPreimages(m) => m.encode(buf)?,
+            HostedMessage::AskBrandingInfo(m) => m.encode(buf)?,
+            HostedMessage::UpdateAddHtlc(m) => m.encode(buf)?,
+            HostedMessage::UpdateFulfillHtlc(m) => m.encode(buf)?,
+            HostedMessage::UpdateFailHtlc(m) => m.encode(buf)?,
+            HostedMessage::UpdateFailMalformedHtlc(m) => m.encode(buf)?,
+            HostedMessage::Error(m) => m.encode(buf)?,
+            HostedMessage::PhcChannelUpdate(m) => m.body.encode(buf)?,
+        }
+        Ok(())
     }
 
     /// Decode from raw bytes (without the tag — caller reads tag first,
@@ -185,6 +213,47 @@ impl HostedMessage {
             )));
         }
         Ok(msg)
+    }
+
+    /// Decode strict `tag || body` framing or legacy `tag || u16_len || body`
+    /// framing used by older cliche/immortan hosted-channel messages.
+    pub fn decode_legacy_aware(data: &[u8]) -> DecodeResult<DecodedHostedMessage> {
+        match Self::decode(data) {
+            Ok(message) => Ok(DecodedHostedMessage {
+                message,
+                encoding: WireEncoding::Strict,
+            }),
+            Err(strict_err) => Self::decode_legacy(data).map_err(|legacy_err| {
+                DecodeError::Invalid(format!(
+                    "strict decode failed: {}; legacy decode failed: {}",
+                    strict_err, legacy_err
+                ))
+            }),
+        }
+    }
+
+    fn decode_legacy(data: &[u8]) -> DecodeResult<DecodedHostedMessage> {
+        let mut buf: &[u8] = data;
+        let tag = codecs::read_u16(&mut buf)?;
+        let body = read_varsize(&mut buf)?;
+        if !buf.is_empty() {
+            return Err(DecodeError::Invalid(format!(
+                "{} trailing bytes after legacy frame",
+                buf.len()
+            )));
+        }
+        let mut body_slice: &[u8] = &body;
+        let message = Self::decode_with_tag(tag, &mut body_slice)?;
+        if !body_slice.is_empty() {
+            return Err(DecodeError::Invalid(format!(
+                "{} trailing bytes after legacy message",
+                body_slice.len()
+            )));
+        }
+        Ok(DecodedHostedMessage {
+            message,
+            encoding: WireEncoding::Legacy,
+        })
     }
 }
 
@@ -537,7 +606,9 @@ impl HostedChannelBranding {
             }
         }
         if std::str::from_utf8(&self.contact_info).is_err() {
-            return Err(EncodeError::InvalidUtf8("contact_info is not valid UTF-8".into()));
+            return Err(EncodeError::InvalidUtf8(
+                "contact_info is not valid UTF-8".into(),
+            ));
         }
         write_varsize(buf, &self.contact_info)?;
         Ok(())
@@ -785,6 +856,46 @@ mod tests {
         encoded.push(0);
 
         assert!(HostedMessage::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn legacy_framed_invoke_decodes() {
+        let msg = HostedMessage::InvokeHostedChannel(InvokeHostedChannel {
+            chain_hash: [1u8; 32],
+            refund_scriptpubkey: Bytes::from_static(&[0x00, 0x14]),
+            secret: Bytes::from_static(&[0x42; 32]),
+        });
+        let encoded = msg.encode_with_encoding(WireEncoding::Legacy).unwrap();
+        assert_eq!(&encoded[..2], &[0xff, 0xff]);
+        assert_eq!(u16::from_be_bytes([encoded[2], encoded[3]]) as usize, 70);
+
+        let decoded = HostedMessage::decode_legacy_aware(&encoded).unwrap();
+        assert_eq!(decoded.encoding, WireEncoding::Legacy);
+        assert_eq!(decoded.message, msg);
+    }
+
+    #[test]
+    fn decode_legacy_aware_prefers_strict_when_valid() {
+        let msg = HostedMessage::AskBrandingInfo(AskBrandingInfo {
+            chain_hash: [2; 32],
+        });
+        let encoded = msg.encode().unwrap();
+        let decoded = HostedMessage::decode_legacy_aware(&encoded).unwrap();
+        assert_eq!(decoded.encoding, WireEncoding::Strict);
+        assert_eq!(decoded.message, msg);
+    }
+
+    #[test]
+    fn legacy_decode_rejects_length_mismatch() {
+        let msg = HostedMessage::AskBrandingInfo(AskBrandingInfo {
+            chain_hash: [3; 32],
+        });
+        let mut encoded = msg
+            .encode_with_encoding(WireEncoding::Legacy)
+            .unwrap()
+            .to_vec();
+        encoded[3] = encoded[3].saturating_add(1);
+        assert!(HostedMessage::decode_legacy_aware(&encoded).is_err());
     }
 
     #[test]

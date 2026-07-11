@@ -5,9 +5,9 @@
 //! (matching the scoin reference implementation exactly).
 
 use crate::wire::codecs::{
-    self, decode_update_add_htlc_body, encode_update_add_htlc_body, read_bool, read_length_delimited,
-    read_signature, read_u16, read_u32, read_u64_overflow, read_varsize, write_bool,
-    write_length_delimited, write_signature, write_u16, write_u32, write_u32_le,
+    self, decode_update_add_htlc_body, encode_update_add_htlc_body, read_bool,
+    read_length_delimited, read_signature, read_u16, read_u32, read_u64_overflow, read_varsize,
+    write_bool, write_length_delimited, write_signature, write_u16, write_u32, write_u32_le,
     write_u64_overflow_le, write_varsize, DecodeError, DecodeResult, EncodeResult,
 };
 use bytes::BytesMut;
@@ -510,6 +510,9 @@ mod tests {
         encoded[ihc_len_pos] = (old_len + 1) as u8;
         let mut slice: &[u8] = &encoded;
         let result = LastCrossSignedState::decode(&mut slice);
-        assert!(result.is_err(), "decode should reject trailing bytes in IHC body");
+        assert!(
+            result.is_err(),
+            "decode should reject trailing bytes in IHC body"
+        );
     }
 }

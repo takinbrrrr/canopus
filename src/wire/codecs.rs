@@ -505,7 +505,12 @@ mod tests {
             let mut buf = BytesMut::new();
             write_varint(&mut buf, v);
             let mut slice: &[u8] = &buf;
-            assert_eq!(read_varint(&mut slice).unwrap(), v, "varint roundtrip for {}", v);
+            assert_eq!(
+                read_varint(&mut slice).unwrap(),
+                v,
+                "varint roundtrip for {}",
+                v
+            );
         }
     }
 

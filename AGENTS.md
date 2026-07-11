@@ -90,7 +90,7 @@ Then `SHA256(material)`. Signatures are compact 64-byte ECDSA (non-recoverable).
 ## What's Complete
 
 - Wire codecs for all bLIP-17 message types plus poncho-compatible `resize_channel`, preimage query/reply, `announcement_signature` (65523), `query_public_hosted_channels` (65519), `reply_public_hosted_channels_end` (65517), and typed PHC `ChannelUpdate` (64509/64507) — all with strict scoin-compatible encoding (tested)
-- All encoding is fallible (`EncodeResult`); `uint64overflow` bounds enforced everywhere (reject >= 2^63); `read_varint` 0xff threshold fixed to `0x1_0000_0000`; `write_varsize` checks u16::MAX; onion packet length enforced at 1366 bytes on encode; strict canonical TLV validation (monotonic tags, no duplicates, even tags < 2^32 rejected); legacy `tag || len || body` framing removed; `HostedChannelBranding.contact_info` validated as UTF-8
+- All encoding is fallible (`EncodeResult`); `uint64overflow` bounds enforced everywhere (reject >= 2^63); `read_varint` 0xff threshold fixed to `0x1_0000_0000`; `write_varsize` checks u16::MAX; onion packet length enforced at 1366 bytes on encode; strict canonical TLV validation (monotonic tags, no duplicates, even tags < 2^32 rejected); inbound framing auto-detects strict `tag || body` and legacy cliche/immortan `tag || len || body`, and outbound framing follows the detected per-session encoding; `HostedChannelBranding.contact_info` validated as UTF-8
 - LCSS with `reverse()`, `hosted_sig_hash()` (returns `EncodeResult`), `sign()` (returns `EncodeResult`), `verify_remote_sig()` (returns `false` on encode error), `state_update()`, `state_override()` (cross-sign consistency tested)
 - Node key derivation from hsm_secret (HKDF-SHA256, legacy plain, mnemonic passphrase/no-passphrase tested; legacy encrypted needs live CLN fixture validation)
 - Datastore with generation CAS + retry + `Arc<T>` blanket impl (tested)
@@ -110,7 +110,7 @@ No `TODO` or `stub` markers are expected in `src/`. Current known gaps are exter
 
 1. **Live CLN/regtest validation**: `ClnStore`, `ClnNode`, production handler wiring, hook request/response JSON shapes, notifications, and datastore generation behavior compile but still need testing against real `lightningd`/`bitcoind`.
 2. **Full direct hosted `pay` interception**: `rpc_command` is registered and returns `continue` for `pay`. Full poncho-style direct hosted payments require BOLT11 parsing, route-hint matching, final-hop onion creation, and direct hosted HTLC result handling.
-3. **Interop hardening**: run against `cliche` and/or poncho-compatible clients to validate resize semantics, channel updates, failure wrapping, and HTLC replay behavior on restart. Legacy framing support has been removed; all messages use strict `tag || body` framing only.
+3. **Interop hardening**: run against `cliche` and/or poncho-compatible clients to validate strict/legacy framing auto-detection, resize semantics, channel updates, failure wrapping, and HTLC replay behavior on restart.
 4. **Hosted-to-hosted forwarding edge cases**: persisted `ForwardLink`s include payment hash and optional shared secret, and mock tests cover basic resolution/failure wrapping. More restart and multi-channel tests should be added when live interop is available.
 
 ## Testing Patterns

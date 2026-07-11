@@ -12,7 +12,9 @@ use canopusd::wire::{
     HostedMessage, InvokeHostedChannel, QueryPreimages, ResizeChannel, StateUpdate, UpdateFailHtlc,
 };
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Test harness: sets up a controller with mock node + memory store.
 async fn make_harness(
@@ -38,6 +40,7 @@ async fn make_harness(
         config,
         node_secret: host_secret,
         node_public: host_public,
+        peer_wire_encodings: Arc::new(Mutex::new(HashMap::new())),
     });
 
     (controller, node, client_secret, client_public)

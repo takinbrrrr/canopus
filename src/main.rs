@@ -14,6 +14,7 @@ use canopusd::wire::{
 };
 use cln_plugin::options::Value;
 use cln_plugin::options::{BooleanConfigOption, ConfigOption};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -241,6 +242,7 @@ async fn build_runtime(
         config: config.clone(),
         node_secret: keys.secret,
         node_public,
+        peer_wire_encodings: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
     Ok(RuntimeState::Unlocked {
         controller,
@@ -644,8 +646,8 @@ mod handler {
             .ok_or_else(|| anyhow::anyhow!("custommsg missing message"))?;
         let peer_id = parse_peer(peer_id)?;
         let bytes = hex::decode(message)?;
-        let msg = match HostedMessage::decode(&bytes) {
-            Ok(msg) => msg,
+        let decoded = match HostedMessage::decode_legacy_aware(&bytes) {
+            Ok(decoded) => decoded,
             Err(err) => {
                 let tag = bytes
                     .get(..2)
@@ -662,6 +664,10 @@ mod handler {
             }
         };
         let controller = controller(&plugin).await?;
+        controller
+            .note_peer_wire_encoding(&peer_id, decoded.encoding)
+            .await;
+        let msg = decoded.message;
         match msg {
             HostedMessage::InvokeHostedChannel(m) => controller.handle_invoke(&peer_id, m).await?,
             HostedMessage::LastCrossSignedState(m) => controller.handle_lcss(&peer_id, m).await?,
@@ -695,7 +701,7 @@ mod handler {
             | HostedMessage::ReplyPublicHostedChannelsEnd(_)
             | HostedMessage::PhcChannelUpdate(_) => {}
         }
-        Ok(json!({ "result": "handled" }))
+        Ok(json!({ "result": "continue" }))
     }
 
     pub async fn handle_htlc_accepted(

@@ -6,9 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::channel_id::{hosted_short_channel_id, is_node1};
 use crate::config::ChannelPolicy;
-use crate::wire::{
-    ChannelUpdate, PhcChannelUpdate, TAG_PHC_CHANNEL_UPDATE_SYNC,
-};
+use crate::wire::{ChannelUpdate, PhcChannelUpdate, TAG_PHC_CHANNEL_UPDATE_SYNC};
 
 /// Build a signed BOLT-7 `channel_update` as a typed [`ChannelUpdate`].
 ///
@@ -140,7 +138,9 @@ mod tests {
         let policy = ChannelPolicy::default();
         let phc = phc_channel_update_sync(&sk, &pk, &peer, [1; 32], &policy, true, 1_700_000_000);
         assert_eq!(phc.tag, 64507);
-        let encoded = crate::wire::HostedMessage::PhcChannelUpdate(phc).encode().unwrap();
+        let encoded = crate::wire::HostedMessage::PhcChannelUpdate(phc)
+            .encode()
+            .unwrap();
         assert_eq!(&encoded[..2], &[0xFB, 0xFB]);
     }
 

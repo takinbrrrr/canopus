@@ -19,12 +19,14 @@ use crate::wire::codecs::UpdateAddHtlc;
 use crate::wire::lcss::{InitHostedChannel, LastCrossSignedState};
 use crate::wire::{
     AskBrandingInfo, HcError, HostedChannelBranding, HostedMessage, InvokeHostedChannel,
-    StateOverride, StateUpdate,
+    StateOverride, StateUpdate, WireEncoding,
 };
 use bytes::Bytes;
 use secp256k1::{PublicKey, SecretKey};
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
@@ -120,6 +122,7 @@ pub struct ChannelController {
     pub config: Config,
     pub node_secret: SecretKey,
     pub node_public: PublicKey,
+    pub peer_wire_encodings: Arc<Mutex<HashMap<PublicKey, WireEncoding>>>,
 }
 
 impl ChannelController {
@@ -139,6 +142,22 @@ impl ChannelController {
             "secrets".to_string(),
             hex::encode(secret.as_bytes()),
         ]
+    }
+
+    pub async fn note_peer_wire_encoding(&self, peer_id: &PublicKey, encoding: WireEncoding) {
+        self.peer_wire_encodings
+            .lock()
+            .await
+            .insert(*peer_id, encoding);
+    }
+
+    async fn peer_wire_encoding(&self, peer_id: &PublicKey) -> WireEncoding {
+        self.peer_wire_encodings
+            .lock()
+            .await
+            .get(peer_id)
+            .copied()
+            .unwrap_or(WireEncoding::Strict)
     }
 
     /// Get the store key for an HTLC forward.
@@ -1479,7 +1498,18 @@ impl ChannelController {
 
     /// Send a message to the peer.
     async fn send_message(&self, peer_id: &PublicKey, msg: HostedMessage) -> ChannelResult<()> {
-        let bytes = msg.encode()?;
+        let encoding = self.peer_wire_encoding(peer_id).await;
+        self.send_message_with_encoding(peer_id, msg, encoding)
+            .await
+    }
+
+    async fn send_message_with_encoding(
+        &self,
+        peer_id: &PublicKey,
+        msg: HostedMessage,
+        encoding: WireEncoding,
+    ) -> ChannelResult<()> {
+        let bytes = msg.encode_with_encoding(encoding)?;
         self.node.send_custom_msg(peer_id, bytes).await?;
         Ok(())
     }
@@ -1522,8 +1552,12 @@ impl ChannelController {
             derive_status(&data) == Status::Active,
             timestamp,
         );
+        let encoding = self.peer_wire_encoding(peer_id).await;
         self.node
-            .send_custom_msg(peer_id, HostedMessage::PhcChannelUpdate(phc).encode()?)
+            .send_custom_msg(
+                peer_id,
+                HostedMessage::PhcChannelUpdate(phc).encode_with_encoding(encoding)?,
+            )
             .await?;
         Ok(())
     }
@@ -2007,7 +2041,8 @@ impl ChannelController {
     }
 
     /// Handle a disconnect notification.
-    pub async fn handle_disconnect(&self, _peer_id: &PublicKey) -> ChannelResult<()> {
+    pub async fn handle_disconnect(&self, peer_id: &PublicKey) -> ChannelResult<()> {
+        self.peer_wire_encodings.lock().await.remove(peer_id);
         // Nothing to do — state is persisted; reconciliation happens on reconnect
         Ok(())
     }
@@ -2035,6 +2070,7 @@ mod tests {
             config,
             node_secret: secret,
             node_public: public,
+            peer_wire_encodings: Arc::new(Mutex::new(HashMap::new())),
         };
         (controller, node)
     }
@@ -2171,6 +2207,56 @@ mod tests {
         // Should not send init (secret required, none provided)
         let sent = node.sent_messages.lock().unwrap();
         assert!(sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_session_invoke_gets_legacy_init() {
+        let (controller, node) = make_controller().await;
+
+        let secp = secp256k1::Secp256k1::new();
+        let (_, client_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        controller
+            .note_peer_wire_encoding(&client_public, WireEncoding::Legacy)
+            .await;
+
+        controller
+            .handle_invoke(&client_public, make_invoke(""))
+            .await
+            .unwrap();
+
+        let sent = node.sent_messages.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(&sent[0].1[..2], &[0xff, 0xfd]);
+        let body_len = u16::from_be_bytes([sent[0].1[2], sent[0].1[3]]) as usize;
+        assert_eq!(body_len, sent[0].1.len() - 4);
+        let decoded = HostedMessage::decode_legacy_aware(&sent[0].1).unwrap();
+        assert_eq!(decoded.encoding, WireEncoding::Legacy);
+        assert!(matches!(
+            decoded.message,
+            HostedMessage::InitHostedChannel(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_legacy_session_encoding() {
+        let (controller, _node) = make_controller().await;
+
+        let secp = secp256k1::Secp256k1::new();
+        let (_, client_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        controller
+            .note_peer_wire_encoding(&client_public, WireEncoding::Legacy)
+            .await;
+        assert_eq!(
+            controller.peer_wire_encoding(&client_public).await,
+            WireEncoding::Legacy
+        );
+
+        controller.handle_disconnect(&client_public).await.unwrap();
+
+        assert_eq!(
+            controller.peer_wire_encoding(&client_public).await,
+            WireEncoding::Strict
+        );
     }
 
     #[tokio::test]
