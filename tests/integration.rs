@@ -384,6 +384,42 @@ async fn test_reconnection_lcss_exchange() {
 }
 
 #[tokio::test]
+async fn test_reconnection_accepts_client_view_lcss() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    let lcss = establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .handle_invoke(&client_public, make_invoke(""))
+        .await
+        .unwrap();
+
+    let host_lcss = match last_sent_message(&node) {
+        HostedMessage::LastCrossSignedState(received_lcss) => received_lcss,
+        _ => panic!("expected last_cross_signed_state"),
+    };
+    assert_eq!(host_lcss, lcss);
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .handle_lcss(&client_public, host_lcss.reverse())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Active
+    );
+    match last_sent_message(&node) {
+        HostedMessage::LastCrossSignedState(received_lcss) => assert_eq!(received_lcss, lcss),
+        HostedMessage::Error(err) => {
+            panic!("unexpected error: {}", String::from_utf8_lossy(&err.data))
+        }
+        _ => panic!("expected last_cross_signed_state"),
+    }
+}
+
+#[tokio::test]
 async fn test_branding_on_request() {
     let (mut controller_builder, _node, _client_secret, client_public) = make_harness(false).await;
     // We need to set branding on the config — but the controller is behind Arc

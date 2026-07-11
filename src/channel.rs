@@ -1235,11 +1235,11 @@ impl ChannelController {
             .await?
             .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
 
-        // Verify both signatures
-        // 1. The peer's sig over our view (msg.remote_sig_of_local verified on msg)
-        if !msg.verify_remote_sig(peer_id) {
+        // The peer sends LCSS from its own view. In that view, remote_sig_of_local
+        // is our signature and local_sig_of_remote is the peer's signature.
+        if !msg.verify_remote_sig(&self.node_public) {
             // Bad signature — error the channel
-            self.mark_errored(peer_id, &data, "bad signature in lcss from peer")
+            self.mark_errored(peer_id, &data, "our signature doesn't match in peer lcss")
                 .await?;
             // Send error to peer
             self.send_message(
@@ -1254,26 +1254,25 @@ impl ChannelController {
             return Err(ChannelError::Errored);
         }
 
-        // 2. Our sig over the peer's view (msg.local_sig_of_remote verified on reversed msg)
         let reversed = msg.reverse();
-        if !reversed.verify_remote_sig(&self.node_public) {
-            self.mark_errored(peer_id, &data, "our signature doesn't match in peer lcss")
+        if !reversed.verify_remote_sig(peer_id) {
+            self.mark_errored(peer_id, &data, "bad signature in lcss from peer")
                 .await?;
             return Err(ChannelError::Errored);
         }
 
-        // Compare total updates
-        let our_total = data.lcss.total_updates();
-        let their_total = msg.total_updates();
-
-        if their_total < our_total {
+        if reversed.local_updates < data.lcss.local_updates
+            || reversed.remote_updates < data.lcss.remote_updates
+        {
             // We are ahead — send our lcss, peer should adopt it
             self.send_message(
                 peer_id,
                 HostedMessage::LastCrossSignedState(data.lcss.clone()),
             )
             .await?;
-        } else if their_total == our_total {
+        } else if reversed.local_updates == data.lcss.local_updates
+            && reversed.remote_updates == data.lcss.remote_updates
+        {
             // In agreement — send our lcss to acknowledge
             self.send_message(
                 peer_id,
@@ -1282,7 +1281,7 @@ impl ChannelController {
             .await?;
         } else {
             // We are behind — adopt the peer's state (reverse it)
-            let adopted = msg.reverse();
+            let adopted = reversed;
             let mut new_data = data.clone();
             new_data.lcss = adopted;
             new_data.uncommitted.clear();
