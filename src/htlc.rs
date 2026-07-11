@@ -110,7 +110,8 @@ impl HtlcManager {
 
         // Add the HTLC to the channel
         let htlc = UpdateAddHtlc {
-            channel_id: 0, // will be assigned
+            channel_id: [0u8; 32], // will be assigned by channel_handle_htlc_add
+            id: 0,
             amount_msat,
             payment_hash,
             cltv_expiry,

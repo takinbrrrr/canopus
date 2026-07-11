@@ -404,7 +404,8 @@ async fn test_htlc_add_to_active_channel() {
     hash_arr.copy_from_slice(&payment_hash);
 
     let htlc = UpdateAddHtlc {
-        channel_id: 0, // will be assigned
+        channel_id: [0u8; 32], // will be assigned
+        id: 0,
         amount_msat: 10_000_000,
         payment_hash: hash_arr,
         cltv_expiry: 700_100,
@@ -446,7 +447,8 @@ async fn test_hosted_fail_wraps_upstream_failure() {
     establish_channel(&controller, &node, &client_secret, &client_public).await;
 
     let htlc = UpdateAddHtlc {
-        channel_id: 0,
+        channel_id: [0u8; 32],
+        id: 0,
         amount_msat: 10_000_000,
         payment_hash: [7; 32],
         cltv_expiry: 700_100,
@@ -462,7 +464,7 @@ async fn test_hosted_fail_wraps_upstream_failure() {
         .handle_update_fail(
             &client_public,
             UpdateFailHtlc {
-                channel_id: 0,
+                channel_id: [0u8; 32],
                 id: 1,
                 reason: Bytes::from_static(&[0x10, 0x07]),
             },
@@ -606,7 +608,8 @@ async fn test_htlc_resolution_with_known_preimage() {
 
     // Add HTLC — should be immediately resolved (idempotency)
     let htlc = UpdateAddHtlc {
-        channel_id: 0,
+        channel_id: [0u8; 32],
+        id: 0,
         amount_msat: 10_000_000,
         payment_hash: hash_arr,
         cltv_expiry: 700_100,

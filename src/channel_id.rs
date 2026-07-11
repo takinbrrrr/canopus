@@ -30,8 +30,10 @@ pub fn channel_id(local: &PublicKey, remote: &PublicKey) -> [u8; 32] {
 
 /// The fake short channel id used for routing and HTLC matching.
 ///
-/// Computed as the sum of eight big-endian u64 chunks of the 66-byte
-/// sorted pubkey concatenation.
+/// Computed as the sum of eight big-endian u64 chunks of the first 64 bytes
+/// of the 66-byte sorted pubkey concatenation (matching scoin's
+/// `hostedShortChannelId` which reads exactly 8 chunks, ignoring the
+/// remaining 2 bytes).
 pub fn hosted_short_channel_id(local: &PublicKey, remote: &PublicKey) -> u64 {
     let (a, b) = sort_keys(local, remote);
     let mut concat = [0u8; 66];
@@ -39,16 +41,11 @@ pub fn hosted_short_channel_id(local: &PublicKey, remote: &PublicKey) -> u64 {
     concat[33..].copy_from_slice(&b.serialize());
 
     let mut sum: u64 = 0;
-    for chunk in concat.chunks_exact(8) {
+    for chunk in concat[..64].chunks_exact(8) {
         let mut arr = [0u8; 8];
         arr.copy_from_slice(chunk);
         sum = sum.wrapping_add(u64::from_be_bytes(arr));
     }
-    // Handle the remaining 2 bytes (66 = 8*8 + 2)
-    let remaining = &concat[64..];
-    let mut arr = [0u8; 8];
-    arr[6..].copy_from_slice(remaining);
-    sum = sum.wrapping_add(u64::from_be_bytes(arr));
 
     sum
 }

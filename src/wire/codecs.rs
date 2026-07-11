@@ -4,6 +4,9 @@
 //! otherwise (the HC messages reuse BOLT-2 message bodies which are BE).
 //! The sighash inside [`crate::wire::lcss`] uses little-endian for the
 //! numeric fields, matching the scoin reference.
+//!
+//! The `lengthDelimited` wrappers used in LCSS encoding use BOLT/TLV
+//! varint length prefixes, matching scoin's `variableSizeBytesLong(varintoverflow, codec)`.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
@@ -88,6 +91,53 @@ pub fn read_signature(buf: &mut &[u8]) -> DecodeResult<[u8; 64]> {
 }
 
 // ---------------------------------------------------------------------------
+// BOLT varint (used by lengthDelimited in scoin)
+// ---------------------------------------------------------------------------
+
+/// Write a BOLT/TLV varint (big-endian multi-byte forms).
+pub fn write_varint(buf: &mut BytesMut, v: u64) {
+    if v < 0xfd {
+        buf.put_u8(v as u8);
+    } else if v <= 0xffff {
+        buf.put_u8(0xfd);
+        buf.put_u16(v as u16);
+    } else if v <= 0xffff_ffff {
+        buf.put_u8(0xfe);
+        buf.put_u32(v as u32);
+    } else {
+        buf.put_u8(0xff);
+        buf.put_u64(v);
+    }
+}
+
+/// Read a BOLT/TLV varint (big-endian multi-byte forms).
+pub fn read_varint(buf: &mut &[u8]) -> DecodeResult<u64> {
+    let prefix = read_u8(buf)?;
+    Ok(match prefix {
+        0xff => read_u64(buf)?,
+        0xfe => read_u32(buf)? as u64,
+        0xfd => read_u16(buf)? as u64,
+        _ => prefix as u64,
+    })
+}
+
+/// Write a lengthDelimited body: varint length prefix + body bytes.
+pub fn write_length_delimited(buf: &mut BytesMut, body: &[u8]) {
+    write_varint(buf, body.len() as u64);
+    buf.extend_from_slice(body);
+}
+
+/// Read a lengthDelimited body: varint length prefix + body bytes.
+/// Returns the body and consumes it from the buffer.
+pub fn read_length_delimited(buf: &mut &[u8]) -> DecodeResult<Bytes> {
+    let len = read_varint(buf)? as usize;
+    if buf.remaining() < len {
+        return Err(DecodeError::Eof);
+    }
+    Ok(buf.copy_to_bytes(len))
+}
+
+// ---------------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------------
 
@@ -142,42 +192,42 @@ pub fn write_u32_le(buf: &mut BytesMut, v: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// BOLT-2 update_add_htlc body encoding
+// BOLT-2 update_add_htlc body encoding (scoin-compatible)
 // ---------------------------------------------------------------------------
 
-/// `update_add_htlc` message body (BOLT-2), without the type prefix.
+/// The fixed onion routing packet size (version + pubkey + payload + hmac).
+pub const ONION_ROUTING_PACKET_SIZE: usize = 1366;
+
+/// `update_add_htlc` message body, matching scoin's `updateAddHtlcCodec`.
 ///
 /// ```text
-/// u64 channel_id
-/// u64 amount_msat
-/// u64 payment_hash
-/// u64 cltv_expiry
-/// u16 onion_routing_packet_len  (always 1366)
-/// [1366]byte onion_routing_packet
+/// [32] channel_id (bytes32 — the hosted channel id)
+/// [8]  id (u64 BE — the HTLC id)
+/// [8]  amount_msat (u64 BE)
+/// [32] payment_hash (bytes32)
+/// [4]  cltv_expiry (u32 BE)
+/// [1366] onion_routing_packet (fixed, no length prefix)
+/// [0+] tlv_stream (empty for HC)
 /// ```
 pub fn encode_update_add_htlc_body(buf: &mut BytesMut, htlc: &UpdateAddHtlc) {
-    write_u64(buf, htlc.channel_id);
+    write_32(buf, &htlc.channel_id);
+    write_u64(buf, htlc.id);
     write_u64(buf, htlc.amount_msat);
     write_32(buf, &htlc.payment_hash);
     write_u32(buf, htlc.cltv_expiry);
-    write_u16(buf, htlc.onion_routing_packet.len() as u16);
     write_bytes(buf, &htlc.onion_routing_packet);
 }
 
 pub fn decode_update_add_htlc_body(buf: &mut &[u8]) -> DecodeResult<UpdateAddHtlc> {
-    let channel_id = read_u64(buf)?;
+    let channel_id = read_32(buf)?;
+    let id = read_u64(buf)?;
     let amount_msat = read_u64(buf)?;
     let payment_hash = read_32(buf)?;
     let cltv_expiry = read_u32(buf)?;
-    let onion = read_varsize(buf)?;
-    if onion.len() != 1366 {
-        return Err(DecodeError::Invalid(format!(
-            "onion packet must be 1366 bytes, got {}",
-            onion.len()
-        )));
-    }
+    let onion = read_bytes(buf, ONION_ROUTING_PACKET_SIZE)?;
     Ok(UpdateAddHtlc {
         channel_id,
+        id,
         amount_msat,
         payment_hash,
         cltv_expiry,
@@ -185,14 +235,14 @@ pub fn decode_update_add_htlc_body(buf: &mut &[u8]) -> DecodeResult<UpdateAddHtl
     })
 }
 
-/// An `update_add_htlc` as carried inside a `last_cross_signed_state`.
+/// An `update_add_htlc` as carried inside hosted channel messages.
 ///
-/// Note: in the BOLT-2 body, the `channel_id` field serves as the HTLC id
-/// within the hosted channel (there is no separate per-channel funding).
+/// Uses the full scoin/BOLT-2 body layout with a 32-byte `channel_id`
+/// (the hosted channel id) and a separate `id` field (the HTLC id).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateAddHtlc {
-    /// In HC context, this is the HTLC id (unique within the channel).
-    pub channel_id: u64,
+    pub channel_id: [u8; 32],
+    pub id: u64,
     pub amount_msat: u64,
     pub payment_hash: [u8; 32],
     pub cltv_expiry: u32,
@@ -201,9 +251,8 @@ pub struct UpdateAddHtlc {
 }
 
 impl UpdateAddHtlc {
-    /// The HTLC id — in HC, `channel_id` from the BOLT-2 body is used as the id.
     pub fn htlc_id(&self) -> u64 {
-        self.channel_id
+        self.id
     }
 }
 
@@ -218,6 +267,23 @@ pub mod serde_bytes_hex {
         hex::decode(&s)
             .map(Bytes::from)
             .map_err(|e| serde::de::Error::custom(e.to_string()))
+    }
+}
+
+pub mod serde_array_hex_32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(b))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("expected 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
     }
 }
 
@@ -242,13 +308,25 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_varint() {
+        let cases: &[u64] = &[0, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffff_ffff, 0x1_0000_0000];
+        for &v in cases {
+            let mut buf = BytesMut::new();
+            write_varint(&mut buf, v);
+            let mut slice: &[u8] = &buf;
+            assert_eq!(read_varint(&mut slice).unwrap(), v, "varint roundtrip for {}", v);
+        }
+    }
+
+    #[test]
     fn roundtrip_update_add_htlc() {
         let htlc = UpdateAddHtlc {
-            channel_id: 42,
+            channel_id: [0xCC; 32],
+            id: 42,
             amount_msat: 1_000_000,
             payment_hash: [0xAA; 32],
             cltv_expiry: 800_000,
-            onion_routing_packet: Bytes::from(vec![0xBB; 1366]),
+            onion_routing_packet: Bytes::from(vec![0xBB; ONION_ROUTING_PACKET_SIZE]),
         };
         let mut buf = BytesMut::new();
         encode_update_add_htlc_body(&mut buf, &htlc);

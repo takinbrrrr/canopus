@@ -253,7 +253,7 @@ impl InvokeHostedChannel {
     }
 }
 
-/// `state_update` (65529) and `state_override` (65527) share the same body.
+/// `state_update` (65529)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateUpdate {
     pub block_day: u32,
@@ -280,8 +280,35 @@ impl StateUpdate {
     }
 }
 
-/// `state_override` (65527) — same body as state_update.
-pub type StateOverride = StateUpdate;
+/// `state_override` (65527) — includes local_balance, matching scoin's StateOverride.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateOverride {
+    pub block_day: u32,
+    pub local_balance_msat: u64,
+    pub local_updates: u32,
+    pub remote_updates: u32,
+    pub local_sig_of_remote: [u8; 64],
+}
+
+impl StateOverride {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        write_u32(buf, self.block_day);
+        write_u64(buf, self.local_balance_msat);
+        write_u32(buf, self.local_updates);
+        write_u32(buf, self.remote_updates);
+        write_signature(buf, &self.local_sig_of_remote);
+    }
+
+    pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        Ok(Self {
+            block_day: read_u32(buf)?,
+            local_balance_msat: read_u64(buf)?,
+            local_updates: read_u32(buf)?,
+            remote_updates: read_u32(buf)?,
+            local_sig_of_remote: read_signature(buf)?,
+        })
+    }
+}
 
 /// `ask_branding_info` (65511)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,8 +406,7 @@ impl HostedChannelBranding {
     }
 }
 
-/// `update_add_htlc` (63505) — BOLT-2 body, but with channel_id used as
-/// the HC "channel id" derived from the two pubkeys.
+/// `update_add_htlc` (63505) — full scoin/BOLT-2 body with 32-byte channel_id.
 impl UpdateAddHtlc {
     pub fn encode(&self, buf: &mut BytesMut) {
         codecs::encode_update_add_htlc_body(buf, self);
@@ -393,20 +419,20 @@ impl UpdateAddHtlc {
 /// `update_fulfill_htlc` (63503)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateFulfillHtlc {
-    pub channel_id: u64,
+    pub channel_id: [u8; 32],
     pub id: u64,
     pub payment_preimage: [u8; 32],
 }
 
 impl UpdateFulfillHtlc {
     pub fn encode(&self, buf: &mut BytesMut) {
-        write_u64(buf, self.channel_id);
+        write_32(buf, &self.channel_id);
         write_u64(buf, self.id);
         write_32(buf, &self.payment_preimage);
     }
     pub fn decode_body(buf: &mut &[u8]) -> DecodeResult<Self> {
         Ok(Self {
-            channel_id: read_u64(buf)?,
+            channel_id: read_32(buf)?,
             id: read_u64(buf)?,
             payment_preimage: read_32(buf)?,
         })
@@ -416,20 +442,20 @@ impl UpdateFulfillHtlc {
 /// `update_fail_htlc` (63501)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateFailHtlc {
-    pub channel_id: u64,
+    pub channel_id: [u8; 32],
     pub id: u64,
     pub reason: Bytes,
 }
 
 impl UpdateFailHtlc {
     pub fn encode(&self, buf: &mut BytesMut) {
-        write_u64(buf, self.channel_id);
+        write_32(buf, &self.channel_id);
         write_u64(buf, self.id);
         write_varsize(buf, &self.reason);
     }
     pub fn decode_body(buf: &mut &[u8]) -> DecodeResult<Self> {
         Ok(Self {
-            channel_id: read_u64(buf)?,
+            channel_id: read_32(buf)?,
             id: read_u64(buf)?,
             reason: read_varsize(buf)?,
         })
@@ -439,7 +465,7 @@ impl UpdateFailHtlc {
 /// `update_fail_malformed_htlc` (63499)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateFailMalformedHtlc {
-    pub channel_id: u64,
+    pub channel_id: [u8; 32],
     pub id: u64,
     pub sha256_of_onion: [u8; 32],
     pub failure_code: u16,
@@ -447,14 +473,14 @@ pub struct UpdateFailMalformedHtlc {
 
 impl UpdateFailMalformedHtlc {
     pub fn encode(&self, buf: &mut BytesMut) {
-        write_u64(buf, self.channel_id);
+        write_32(buf, &self.channel_id);
         write_u64(buf, self.id);
         write_32(buf, &self.sha256_of_onion);
         codecs::write_u16(buf, self.failure_code);
     }
     pub fn decode_body(buf: &mut &[u8]) -> DecodeResult<Self> {
         Ok(Self {
-            channel_id: read_u64(buf)?,
+            channel_id: read_32(buf)?,
             id: read_u64(buf)?,
             sha256_of_onion: read_32(buf)?,
             failure_code: codecs::read_u16(buf)?,
@@ -462,7 +488,7 @@ impl UpdateFailMalformedHtlc {
     }
 }
 
-/// `error` (63497)
+/// `error` (63497) — matches scoin's errorCodec: channelId + varsize data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HcError {
     pub channel_id: [u8; 32],
@@ -472,15 +498,12 @@ pub struct HcError {
 impl HcError {
     pub fn encode(&self, buf: &mut BytesMut) {
         codecs::write_32(buf, &self.channel_id);
-        codecs::write_bytes(buf, &self.data);
+        codecs::write_varsize(buf, &self.data);
     }
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
         Ok(Self {
             channel_id: read_32(buf)?,
-            data: {
-                // error data is the rest of the message
-                Bytes::copy_from_slice(buf)
-            },
+            data: read_varsize(buf)?,
         })
     }
 }
@@ -550,6 +573,23 @@ mod tests {
     }
 
     #[test]
+    fn state_override_roundtrip() {
+        let msg = StateOverride {
+            block_day: 600_000,
+            local_balance_msat: 50_000_000,
+            local_updates: 5,
+            remote_updates: 3,
+            local_sig_of_remote: [0xAB; 64],
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let mut slice = &buf[..];
+        let dec = StateOverride::decode(&mut slice).unwrap();
+        assert_eq!(dec, msg);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
     fn all_messages_tag_dispatch() {
         let secp = secp256k1::Secp256k1::new();
         let (sk, _) = secp.generate_keypair(&mut rand::rngs::OsRng);
@@ -562,7 +602,7 @@ mod tests {
                 max_accepted_htlcs: 12,
                 channel_capacity_msat: 100_000_000,
                 initial_client_balance_msat: 0,
-                features: Bytes::new(),
+                features: vec![],
             },
             block_day: 600_000,
             local_balance_msat: 100_000_000,
@@ -590,8 +630,9 @@ mod tests {
                 remote_updates: 0,
                 local_sig_of_remote: [0; 64],
             }),
-            HostedMessage::StateOverride(StateUpdate {
+            HostedMessage::StateOverride(StateOverride {
                 block_day: 600_000,
+                local_balance_msat: 80_000_000,
                 local_updates: 1,
                 remote_updates: 1,
                 local_sig_of_remote: [0; 64],
@@ -610,24 +651,25 @@ mod tests {
                 contact_info: Bytes::from_static(b"https://example.org"),
             }),
             HostedMessage::UpdateAddHtlc(UpdateAddHtlc {
-                channel_id: 42,
+                channel_id: [0x42; 32],
+                id: 42,
                 amount_msat: 1_000_000,
                 payment_hash: [3; 32],
                 cltv_expiry: 700_000,
-                onion_routing_packet: Bytes::from(vec![0; 1366]),
+                onion_routing_packet: Bytes::from(vec![0; codecs::ONION_ROUTING_PACKET_SIZE]),
             }),
             HostedMessage::UpdateFulfillHtlc(UpdateFulfillHtlc {
-                channel_id: 42,
+                channel_id: [0x42; 32],
                 id: 1,
                 payment_preimage: [4; 32],
             }),
             HostedMessage::UpdateFailHtlc(UpdateFailHtlc {
-                channel_id: 42,
+                channel_id: [0x42; 32],
                 id: 1,
                 reason: Bytes::from_static(b"fail"),
             }),
             HostedMessage::UpdateFailMalformedHtlc(UpdateFailMalformedHtlc {
-                channel_id: 42,
+                channel_id: [0x42; 32],
                 id: 1,
                 sha256_of_onion: [5; 32],
                 failure_code: 0x4000,

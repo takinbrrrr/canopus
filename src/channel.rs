@@ -319,7 +319,7 @@ impl ChannelController {
             max_accepted_htlcs: policy.max_accepted_htlcs,
             channel_capacity_msat: policy.channel_capacity_msat,
             initial_client_balance_msat: policy.initial_client_balance_msat,
-            features: Bytes::new(),
+            features: vec![],
         };
 
         // Store initial channel data (not yet established)
@@ -387,7 +387,8 @@ impl ChannelController {
                 match update {
                     PendingUpdate::Add { htlc } => {
                         let mut htlc = htlc.clone();
-                        htlc.channel_id = next_id;
+                        htlc.channel_id = channel_id(&self.node_public, peer_id);
+                        htlc.id = next_id;
                         next_id += 1;
                         self.send_message(peer_id, HostedMessage::UpdateAddHtlc(htlc))
                             .await?;
@@ -492,6 +493,7 @@ impl ChannelController {
         if let Some(ref override_lcss) = data.proposed_override {
             let override_msg = StateOverride {
                 block_day: override_lcss.block_day,
+                local_balance_msat: override_lcss.local_balance_msat,
                 local_updates: override_lcss.local_updates,
                 remote_updates: override_lcss.remote_updates,
                 local_sig_of_remote: override_lcss.local_sig_of_remote,
@@ -789,7 +791,7 @@ impl ChannelController {
                 peer_id,
                 HostedMessage::UpdateFailHtlc(crate::wire::UpdateFailHtlc {
                     channel_id: htlc.channel_id,
-                    id: htlc.channel_id,
+                    id: htlc.id,
                     reason,
                 }),
             )
@@ -1333,6 +1335,7 @@ impl ChannelController {
             peer_id,
             HostedMessage::StateOverride(StateOverride {
                 block_day: override_lcss.block_day,
+                local_balance_msat: override_lcss.local_balance_msat,
                 local_updates: override_lcss.local_updates,
                 remote_updates: override_lcss.remote_updates,
                 local_sig_of_remote: override_lcss.local_sig_of_remote,
@@ -1520,7 +1523,8 @@ impl ChannelController {
                     ));
                 }
                 let outgoing_htlc = UpdateAddHtlc {
-                    channel_id: 0,
+                    channel_id: channel_id(&self.node_public, &target_peer),
+                    id: 0,
                     amount_msat: peeled.amt_to_forward,
                     payment_hash: htlc.payment_hash,
                     cltv_expiry: peeled.outgoing_cltv_value,
@@ -1653,7 +1657,8 @@ impl ChannelController {
         )
         .map_err(|e| ChannelError::InvalidMessage(e.to_string()))?;
         let htlc = UpdateAddHtlc {
-            channel_id: htlc_id,
+            channel_id: channel_id(&self.node_public, peer_id),
+            id: htlc_id,
             amount_msat,
             payment_hash,
             cltv_expiry: final_cltv_expiry,
@@ -1697,7 +1702,7 @@ impl ChannelController {
             .uncommitted
             .push(crate::store::UncommittedUpdate::Local(
                 PendingUpdate::Fulfill {
-                    channel_id: 0,
+                    channel_id: channel_id(&self.node_public, peer_id),
                     id: link.incoming_htlc_id,
                     preimage,
                 },
@@ -1707,7 +1712,7 @@ impl ChannelController {
         self.send_message(
             peer_id,
             HostedMessage::UpdateFulfillHtlc(crate::wire::UpdateFulfillHtlc {
-                channel_id: 0,
+                channel_id: channel_id(&self.node_public, peer_id),
                 id: link.incoming_htlc_id,
                 payment_preimage: preimage,
             }),
@@ -1741,7 +1746,7 @@ impl ChannelController {
             .uncommitted
             .push(crate::store::UncommittedUpdate::Local(
                 PendingUpdate::Fail {
-                    channel_id: 0,
+                    channel_id: channel_id(&self.node_public, peer_id),
                     id: link.incoming_htlc_id,
                     reason: reason.clone(),
                 },
@@ -1751,7 +1756,7 @@ impl ChannelController {
         self.send_message(
             peer_id,
             HostedMessage::UpdateFailHtlc(crate::wire::UpdateFailHtlc {
-                channel_id: 0,
+                channel_id: channel_id(&self.node_public, peer_id),
                 id: link.incoming_htlc_id,
                 reason,
             }),
@@ -1885,7 +1890,8 @@ impl ChannelController {
         // Assign HTLC id
         let htlc_id = sm.next_remote_updates() as u64 + 1;
         let mut htlc = htlc;
-        htlc.channel_id = htlc_id;
+        htlc.channel_id = channel_id(&self.node_public, peer_id);
+        htlc.id = htlc_id;
 
         let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id);
         let link = ForwardLink {

@@ -5,11 +5,12 @@
 //! (matching the scoin reference implementation exactly).
 
 use crate::wire::codecs::{
-    self, decode_update_add_htlc_body, encode_update_add_htlc_body, read_bool, read_signature,
-    read_u16, read_u32, read_u64, read_varsize, write_bool, write_signature, write_u16, write_u32,
-    write_u32_le, write_u64, write_u64_le, write_varsize, DecodeResult,
+    self, decode_update_add_htlc_body, encode_update_add_htlc_body, read_bool, read_length_delimited,
+    read_signature, read_u16, read_u32, read_u64, read_varsize, write_bool, write_length_delimited,
+    write_signature, write_u16, write_u32, write_u32_le, write_u64, write_u64_le, write_varsize,
+    DecodeResult,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::{BytesMut};
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 
@@ -21,28 +22,40 @@ pub struct InitHostedChannel {
     pub max_accepted_htlcs: u16,
     pub channel_capacity_msat: u64,
     pub initial_client_balance_msat: u64,
-    #[serde(with = "crate::wire::codecs::serde_bytes_hex")]
-    pub features: Bytes,
+    pub features: Vec<u16>,
 }
 
 impl InitHostedChannel {
     pub fn encode(&self, buf: &mut BytesMut) {
-        write_u64(buf, self.max_htlc_value_in_flight_msat);
-        write_u64(buf, self.htlc_minimum_msat);
-        write_u16(buf, self.max_accepted_htlcs);
-        write_u64(buf, self.channel_capacity_msat);
-        write_u64(buf, self.initial_client_balance_msat);
-        write_varsize(buf, &self.features);
+        codecs::write_u64(buf, self.max_htlc_value_in_flight_msat);
+        codecs::write_u64(buf, self.htlc_minimum_msat);
+        codecs::write_u16(buf, self.max_accepted_htlcs);
+        codecs::write_u64(buf, self.channel_capacity_msat);
+        codecs::write_u64(buf, self.initial_client_balance_msat);
+        codecs::write_u16(buf, self.features.len() as u16);
+        for &f in &self.features {
+            codecs::write_u16(buf, f);
+        }
     }
 
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
+        let max_htlc_value_in_flight_msat = read_u64(buf)?;
+        let htlc_minimum_msat = read_u64(buf)?;
+        let max_accepted_htlcs = read_u16(buf)?;
+        let channel_capacity_msat = read_u64(buf)?;
+        let initial_client_balance_msat = read_u64(buf)?;
+        let n_features = read_u16(buf)? as usize;
+        let mut features = Vec::with_capacity(n_features);
+        for _ in 0..n_features {
+            features.push(read_u16(buf)?);
+        }
         Ok(Self {
-            max_htlc_value_in_flight_msat: read_u64(buf)?,
-            htlc_minimum_msat: read_u64(buf)?,
-            max_accepted_htlcs: read_u16(buf)?,
-            channel_capacity_msat: read_u64(buf)?,
-            initial_client_balance_msat: read_u64(buf)?,
-            features: read_varsize(buf)?,
+            max_htlc_value_in_flight_msat,
+            htlc_minimum_msat,
+            max_accepted_htlcs,
+            channel_capacity_msat,
+            initial_client_balance_msat,
+            features,
         })
     }
 }
@@ -52,7 +65,7 @@ impl InitHostedChannel {
 pub struct LastCrossSignedState {
     pub is_host: bool,
     #[serde(with = "crate::wire::codecs::serde_bytes_hex")]
-    pub last_refund_scriptpubkey: Bytes,
+    pub last_refund_scriptpubkey: bytes::Bytes,
     pub init_hosted_channel: InitHostedChannel,
     pub block_day: u32,
     pub local_balance_msat: u64,
@@ -86,11 +99,17 @@ mod serde_array_hex_64 {
 
 impl LastCrossSignedState {
     // -- wire encode/decode (the 65531 message body) --
+    // -- uses lengthDelimited for initHostedChannel and each HTLC,
+    //    matching scoin's `lengthDelimited(initHostedChannelCodec)` and
+    //    `listOfN(uint16, lengthDelimited(updateAddHtlcCodec))` --
 
     pub fn encode(&self, buf: &mut BytesMut) {
         write_bool(buf, self.is_host);
         write_varsize(buf, &self.last_refund_scriptpubkey);
-        self.init_hosted_channel.encode(buf);
+        // initHostedChannel: lengthDelimited
+        let mut ihc_buf = BytesMut::new();
+        self.init_hosted_channel.encode(&mut ihc_buf);
+        write_length_delimited(buf, &ihc_buf);
         write_u32(buf, self.block_day);
         write_u64(buf, self.local_balance_msat);
         write_u64(buf, self.remote_balance_msat);
@@ -98,11 +117,15 @@ impl LastCrossSignedState {
         write_u32(buf, self.remote_updates);
         write_u16(buf, self.incoming_htlcs.len() as u16);
         for h in &self.incoming_htlcs {
-            encode_update_add_htlc_body(buf, h);
+            let mut htlc_buf = BytesMut::new();
+            encode_update_add_htlc_body(&mut htlc_buf, h);
+            write_length_delimited(buf, &htlc_buf);
         }
         write_u16(buf, self.outgoing_htlcs.len() as u16);
         for h in &self.outgoing_htlcs {
-            encode_update_add_htlc_body(buf, h);
+            let mut htlc_buf = BytesMut::new();
+            encode_update_add_htlc_body(&mut htlc_buf, h);
+            write_length_delimited(buf, &htlc_buf);
         }
         write_signature(buf, &self.remote_sig_of_local);
         write_signature(buf, &self.local_sig_of_remote);
@@ -111,7 +134,9 @@ impl LastCrossSignedState {
     pub fn decode(buf: &mut &[u8]) -> DecodeResult<Self> {
         let is_host = read_bool(buf)?;
         let last_refund_scriptpubkey = read_varsize(buf)?;
-        let init_hosted_channel = InitHostedChannel::decode(buf)?;
+        let ihc_bytes = read_length_delimited(buf)?;
+        let mut ihc_slice: &[u8] = &ihc_bytes;
+        let init_hosted_channel = InitHostedChannel::decode(&mut ihc_slice)?;
         let block_day = read_u32(buf)?;
         let local_balance_msat = read_u64(buf)?;
         let remote_balance_msat = read_u64(buf)?;
@@ -120,12 +145,16 @@ impl LastCrossSignedState {
         let n_in = read_u16(buf)? as usize;
         let mut incoming_htlcs = Vec::with_capacity(n_in);
         for _ in 0..n_in {
-            incoming_htlcs.push(decode_update_add_htlc_body(buf)?);
+            let htlc_bytes = read_length_delimited(buf)?;
+            let mut htlc_slice: &[u8] = &htlc_bytes;
+            incoming_htlcs.push(decode_update_add_htlc_body(&mut htlc_slice)?);
         }
         let n_out = read_u16(buf)? as usize;
         let mut outgoing_htlcs = Vec::with_capacity(n_out);
         for _ in 0..n_out {
-            outgoing_htlcs.push(decode_update_add_htlc_body(buf)?);
+            let htlc_bytes = read_length_delimited(buf)?;
+            let mut htlc_slice: &[u8] = &htlc_bytes;
+            outgoing_htlcs.push(decode_update_add_htlc_body(&mut htlc_slice)?);
         }
         let remote_sig_of_local = read_signature(buf)?;
         let local_sig_of_remote = read_signature(buf)?;
@@ -173,7 +202,7 @@ impl LastCrossSignedState {
     /// Compute the deterministic hash that is signed for this state.
     ///
     /// The material is the concatenation of:
-    ///   refund_scriptpubkey
+    ///   refund_scriptpubkey (raw bytes, no length prefix)
     ///   channel_capacity_msat      (u64 LE)
     ///   initial_client_balance_msat (u64 LE)
     ///   block_day                   (u32 LE)
@@ -181,14 +210,16 @@ impl LastCrossSignedState {
     ///   remote_balance_msat         (u64 LE)
     ///   local_updates               (u32 LE)
     ///   remote_updates              (u32 LE)
-    ///   concat(incoming_htlcs encoded as update_add_htlc bodies)
-    ///   concat(outgoing_htlcs encoded as update_add_htlc bodies)
+    ///   concat(incoming_htlcs encoded as full updateAddHtlcCodec bodies)
+    ///   concat(outgoing_htlcs encoded as full updateAddHtlcCodec bodies)
     ///   1 byte hostFlag (1 if is_host else 0)
+    ///
+    /// Note: HTLC bodies in the sighash are NOT lengthDelimited — they use
+    /// the raw `updateAddHtlcCodec` encoding (channelId + id + amount + hash
+    /// + expiry + onion + empty tlv stream).
     pub fn hosted_sig_hash(&self) -> [u8; 32] {
         let mut buf = BytesMut::with_capacity(256);
-        // refund_scriptpubkey — raw bytes, no length prefix
         codecs::write_bytes(&mut buf, &self.last_refund_scriptpubkey);
-        // numeric fields, little-endian
         write_u64_le(&mut buf, self.init_hosted_channel.channel_capacity_msat);
         write_u64_le(
             &mut buf,
@@ -199,14 +230,12 @@ impl LastCrossSignedState {
         write_u64_le(&mut buf, self.remote_balance_msat);
         write_u32_le(&mut buf, self.local_updates);
         write_u32_le(&mut buf, self.remote_updates);
-        // HTLC lists — full update_add_htlc bodies (BE wire encoding)
         for h in &self.incoming_htlcs {
             encode_update_add_htlc_body(&mut buf, h);
         }
         for h in &self.outgoing_htlcs {
             encode_update_add_htlc_body(&mut buf, h);
         }
-        // hostFlag
         codecs::write_u8(&mut buf, if self.is_host { 1 } else { 0 });
 
         let mut hasher = Sha256::new();
@@ -246,6 +275,7 @@ impl LastCrossSignedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn dummy_lcss() -> LastCrossSignedState {
         LastCrossSignedState {
@@ -257,7 +287,7 @@ mod tests {
                 max_accepted_htlcs: 12,
                 channel_capacity_msat: 100_000_000,
                 initial_client_balance_msat: 10_000_000,
-                features: Bytes::new(),
+                features: vec![],
             },
             block_day: 600_000,
             local_balance_msat: 90_000_000,
@@ -283,17 +313,42 @@ mod tests {
     }
 
     #[test]
+    fn lcss_roundtrip_with_htlcs() {
+        let mut lcss = dummy_lcss();
+        lcss.incoming_htlcs.push(codecs::UpdateAddHtlc {
+            channel_id: [0x11; 32],
+            id: 1,
+            amount_msat: 50_000,
+            payment_hash: [0x22; 32],
+            cltv_expiry: 700_000,
+            onion_routing_packet: Bytes::from(vec![0x33; codecs::ONION_ROUTING_PACKET_SIZE]),
+        });
+        lcss.outgoing_htlcs.push(codecs::UpdateAddHtlc {
+            channel_id: [0x11; 32],
+            id: 2,
+            amount_msat: 30_000,
+            payment_hash: [0x44; 32],
+            cltv_expiry: 700_001,
+            onion_routing_packet: Bytes::from(vec![0x55; codecs::ONION_ROUTING_PACKET_SIZE]),
+        });
+        let mut buf = BytesMut::new();
+        lcss.encode(&mut buf);
+        let mut slice: &[u8] = &buf;
+        let decoded = LastCrossSignedState::decode(&mut slice).unwrap();
+        assert_eq!(decoded, lcss);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
     fn reverse_is_involution() {
         let lcss = dummy_lcss();
         let reversed = lcss.reverse();
         let back = reversed.reverse();
-        // reverse twice restores everything except the sig swap is symmetric
         assert_eq!(back.is_host, lcss.is_host);
         assert_eq!(back.local_balance_msat, lcss.local_balance_msat);
         assert_eq!(back.remote_balance_msat, lcss.remote_balance_msat);
         assert_eq!(back.local_updates, lcss.local_updates);
         assert_eq!(back.incoming_htlcs, lcss.incoming_htlcs);
-        // double-reverse of sigs: remote_sig_of_local goes to local_sig_of_remote and back
         assert_eq!(back.remote_sig_of_local, lcss.remote_sig_of_local);
         assert_eq!(back.local_sig_of_remote, lcss.local_sig_of_remote);
     }
@@ -317,20 +372,13 @@ mod tests {
         let (secret, public) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let mut lcss = dummy_lcss();
         lcss.sign(&secret);
-        // sign() produces local_sig_of_remote (sig over the reverse/peer view).
-        // verify_remote_sig() checks remote_sig_of_local (sig over our view).
-        // The peer's sig over their view = our sig over the reverse.
-        // So copy local_sig_of_remote → remote_sig_of_local for verification.
         lcss.remote_sig_of_local = lcss.local_sig_of_remote;
-        // But verify checks against OUR view's hash, and the sig was over the REVERSE.
-        // So we need to verify on the reversed state.
         let reversed = lcss.reverse();
         assert!(
             reversed.verify_remote_sig(&public),
             "verify_remote_sig should succeed after sign"
         );
 
-        // Tamper: flip is_host, should fail
         let mut tampered = reversed.clone();
         tampered.is_host = !tampered.is_host;
         assert!(
@@ -341,17 +389,12 @@ mod tests {
 
     #[test]
     fn cross_sign_consistency() {
-        // Host signs reverse of its view → local_sig_of_remote.
-        // Client receives it, reverses, and the host's sig should verify
-        // as the client's remote_sig_of_local.
         let secp = Secp256k1::new();
         let (host_secret, host_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let mut host_view = dummy_lcss();
         host_view.sign(&host_secret);
 
-        // Client's view is the reverse of host's view
         let mut client_view = host_view.reverse();
-        // The host's local_sig_of_remote becomes the client's remote_sig_of_local
         client_view.remote_sig_of_local = host_view.local_sig_of_remote;
         assert!(
             client_view.verify_remote_sig(&host_public),

@@ -264,7 +264,7 @@ mod tests {
                 max_accepted_htlcs: 12,
                 channel_capacity_msat: 100_000_000,
                 initial_client_balance_msat: 0,
-                features: Bytes::new(),
+                features: vec![],
             },
             block_day: 600_000,
             local_balance_msat: local_balance,
@@ -280,7 +280,8 @@ mod tests {
 
     fn make_htlc(_id: u64, amount: u64, payment_hash: [u8; 32]) -> UpdateAddHtlc {
         UpdateAddHtlc {
-            channel_id: 1,
+            channel_id: [0u8; 32],
+            id: _id,
             amount_msat: amount,
             payment_hash,
             cltv_expiry: 700_000,
@@ -356,7 +357,7 @@ mod tests {
 
         // We fulfill it
         sm.add_local(PendingUpdate::Fulfill {
-            channel_id: 1,
+            channel_id: [0u8; 32],
             id: 1,
             preimage,
         });
@@ -386,7 +387,7 @@ mod tests {
         let mut sm = StateManager::new(lcss);
 
         sm.add_local(PendingUpdate::Fulfill {
-            channel_id: 1,
+            channel_id: [0u8; 32],
             id: 1,
             preimage: wrong_preimage,
         });
@@ -402,7 +403,7 @@ mod tests {
         let mut sm = StateManager::new(lcss);
 
         sm.add_local(PendingUpdate::Fail {
-            channel_id: 1,
+            channel_id: [0u8; 32],
             id: 1,
             reason: Bytes::new(),
         });
@@ -421,7 +422,7 @@ mod tests {
         let mut sm = StateManager::new(lcss);
 
         sm.add_remote(PendingUpdate::Fail {
-            channel_id: 1,
+            channel_id: [0u8; 32],
             id: 1,
             reason: Bytes::new(),
         });
@@ -447,7 +448,7 @@ mod tests {
         });
         // Remote fails our HTLC
         sm.add_remote(PendingUpdate::Fail {
-            channel_id: 1,
+            channel_id: [0u8; 32],
             id: 1,
             reason: Bytes::new(),
         });

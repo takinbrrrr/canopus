@@ -97,21 +97,24 @@ pub enum PendingUpdate {
     },
     #[serde(rename = "fulfill")]
     Fulfill {
-        channel_id: u64,
+        #[serde(with = "crate::wire::codecs::serde_array_hex_32")]
+        channel_id: [u8; 32],
         id: u64,
         #[serde(with = "serde_array_hex_32")]
         preimage: [u8; 32],
     },
     #[serde(rename = "fail")]
     Fail {
-        channel_id: u64,
+        #[serde(with = "crate::wire::codecs::serde_array_hex_32")]
+        channel_id: [u8; 32],
         id: u64,
         #[serde(with = "crate::wire::codecs::serde_bytes_hex")]
         reason: Bytes,
     },
     #[serde(rename = "fail_malformed")]
     FailMalformed {
-        channel_id: u64,
+        #[serde(with = "crate::wire::codecs::serde_array_hex_32")]
+        channel_id: [u8; 32],
         id: u64,
         #[serde(with = "serde_array_hex_32")]
         sha256_of_onion: [u8; 32],
@@ -553,7 +556,7 @@ mod tests {
                     max_accepted_htlcs: 12,
                     channel_capacity_msat: 100_000_000,
                     initial_client_balance_msat: 0,
-                    features: Bytes::new(),
+                    features: vec![],
                 },
                 block_day: 600_000,
                 local_balance_msat: 100_000_000,

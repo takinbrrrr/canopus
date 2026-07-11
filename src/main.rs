@@ -277,11 +277,13 @@ where
 }
 
 fn chain_hash_for_network(network: &str) -> anyhow::Result<[u8; 32]> {
+    // scoin/poncho uses Block.hash (raw double-SHA256 of the genesis header),
+    // which is the reverse of the display-order block hash.
     let hex = match network {
-        "bitcoin" | "mainnet" => "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        "testnet" => "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
-        "signet" => "00000008819873e925422c1ff0f99f7c4b0b0b944e11793c8cbf7f0ca64d1648",
-        "regtest" => "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+        "bitcoin" | "mainnet" => "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000",
+        "testnet" => "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000",
+        "signet" => "48164da60c7fbf8c3c79114e940b0b4b7c9ff9f01f2c4225e973988108000000",
+        "regtest" => "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f",
         other => anyhow::bail!("unsupported network {other}"),
     };
     let bytes = hex::decode(hex)?;
@@ -719,7 +721,8 @@ mod handler {
             .map(parse_32_hex)
             .transpose()?;
         let htlc = UpdateAddHtlc {
-            channel_id: 0,
+            channel_id: [0u8; 32],
+            id: 0,
             amount_msat,
             payment_hash,
             cltv_expiry,
