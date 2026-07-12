@@ -342,7 +342,9 @@ fn compute_feature_bits_hex(bits: &[u64]) -> String {
 mod handler {
     use super::{build_runtime, PluginState, RuntimeState};
     use bytes::Bytes;
-    use canopusd::channel_id::hosted_short_channel_id;
+    use canopusd::channel_id::{
+        format_short_channel_id, hosted_short_channel_id, parse_short_channel_id,
+    };
     use canopusd::node::{HtlcResolution, PaymentStatus};
     use canopusd::wire::codecs::UpdateAddHtlc;
     use canopusd::wire::{
@@ -802,7 +804,7 @@ mod handler {
         let Some(target_scid) = onion
             .get("short_channel_id")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(parse_short_channel_id)
         else {
             return Ok(hook_continue());
         };
@@ -852,7 +854,7 @@ mod handler {
             let incoming_scid = htlc
                 .get("short_channel_id")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
+                .and_then(parse_short_channel_id)
                 .unwrap_or(target_scid);
             let result_key = format!("{incoming_scid}/{htlc_id}");
             let shared_secret = onion
@@ -1007,9 +1009,13 @@ mod handler {
         let Some(data) = controller.get_channel_data(&peer).await? else {
             return Ok(json!({ "channel": null }));
         };
-        Ok(
-            json!({ "peer_id": peer.to_string(), "status": controller.get_status(&peer).await?.to_string(), "data": data }),
-        )
+        let short_channel_id = hosted_short_channel_id(&controller.node_public, &peer);
+        Ok(json!({
+            "peer_id": peer.to_string(),
+            "status": controller.get_status(&peer).await?.to_string(),
+            "short_channel_id": format_short_channel_id(short_channel_id),
+            "data": data
+        }))
     }
 
     pub async fn handle_add_secret(

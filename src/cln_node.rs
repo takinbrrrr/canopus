@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::channel_id::parse_short_channel_id;
 use crate::node::{HtlcResolution, NodeActions, NodeError, NodeInfo, NodeResult, PaymentStatus};
 
 #[derive(Clone)]
@@ -62,8 +63,9 @@ impl ClnNode {
                 let short_channel_id = channel
                     .get("short_channel_id")
                     .or_else(|| channel.get("alias"))
-                    .and_then(|v| v.as_str());
-                if short_channel_id == Some(&scid.to_string()) {
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_short_channel_id);
+                if short_channel_id == Some(scid) {
                     return PublicKey::from_str(id).map_err(|e| NodeError::Rpc(e.to_string()));
                 }
             }

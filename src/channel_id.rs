@@ -50,6 +50,32 @@ pub fn hosted_short_channel_id(local: &PublicKey, remote: &PublicKey) -> u64 {
     sum
 }
 
+pub fn parse_short_channel_id(s: &str) -> Option<u64> {
+    let mut parts = s.split('x');
+    let block = parse_scid_part(parts.next()?, 0x00ff_ffff)?;
+    let txindex = parse_scid_part(parts.next()?, 0x00ff_ffff)?;
+    let outnum = parse_scid_part(parts.next()?, 0x0000_ffff)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((block << 40) | (txindex << 16) | outnum)
+}
+
+pub fn format_short_channel_id(scid: u64) -> String {
+    let block = scid >> 40;
+    let txindex = (scid >> 16) & 0x00ff_ffff;
+    let outnum = scid & 0x0000_ffff;
+    format!("{block}x{txindex}x{outnum}")
+}
+
+fn parse_scid_part(s: &str, max: u64) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value = s.parse::<u64>().ok()?;
+    (value <= max).then_some(value)
+}
+
 fn sort_keys(a: &PublicKey, b: &PublicKey) -> (PublicKey, PublicKey) {
     let a_bytes = a.serialize();
     let b_bytes = b.serialize();
@@ -94,6 +120,35 @@ mod tests {
             hosted_short_channel_id(&a, &b),
             hosted_short_channel_id(&b, &a)
         );
+    }
+
+    #[test]
+    fn parse_short_channel_id_x_format() {
+        assert_eq!(
+            parse_short_channel_id("539268x845x1"),
+            Some((539268 << 40) | (845 << 16) | 1)
+        );
+        assert_eq!(
+            parse_short_channel_id("7289919x6151974x19301"),
+            Some((7289919 << 40) | (6151974 << 16) | 19301)
+        );
+    }
+
+    #[test]
+    fn format_short_channel_id_x_format() {
+        let scid = parse_short_channel_id("7289919x6151974x19301").unwrap();
+        assert_eq!(format_short_channel_id(scid), "7289919x6151974x19301");
+    }
+
+    #[test]
+    fn parse_short_channel_id_rejects_non_bolt_format() {
+        assert_eq!(parse_short_channel_id("123456789"), None);
+        assert_eq!(parse_short_channel_id("1x2"), None);
+        assert_eq!(parse_short_channel_id("1x2x3x4"), None);
+        assert_eq!(parse_short_channel_id("1xx3"), None);
+        assert_eq!(parse_short_channel_id("1x2x65536"), None);
+        assert_eq!(parse_short_channel_id("16777216x2x3"), None);
+        assert_eq!(parse_short_channel_id("1x16777216x3"), None);
     }
 
     #[test]

@@ -125,7 +125,7 @@ lightning-cli canopusd-list
 
 ### `canopusd-channel peerid`
 
-Get detailed information about a specific channel.
+Get detailed information about a specific channel, including the derived hosted `short_channel_id` in BOLT `blockheightxtxindexxoutnum` format.
 
 ```bash
 lightning-cli canopusd-channel 028789... 
