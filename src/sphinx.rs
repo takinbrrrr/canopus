@@ -331,6 +331,37 @@ pub fn create_single_hop_onion(
     cltv_expiry: u32,
     payment_secret: Option<[u8; 32]>,
 ) -> Result<Vec<u8>, SphinxError> {
+    create_onion(
+        recipient_pubkey,
+        amount_msat,
+        cltv_expiry,
+        0,
+        payment_secret,
+    )
+}
+
+pub fn create_relay_onion(
+    recipient_pubkey: &PublicKey,
+    short_channel_id: u64,
+    amount_msat: u64,
+    cltv_expiry: u32,
+) -> Result<Vec<u8>, SphinxError> {
+    create_onion(
+        recipient_pubkey,
+        amount_msat,
+        cltv_expiry,
+        short_channel_id,
+        None,
+    )
+}
+
+fn create_onion(
+    recipient_pubkey: &PublicKey,
+    amount_msat: u64,
+    cltv_expiry: u32,
+    short_channel_id: u64,
+    payment_secret: Option<[u8; 32]>,
+) -> Result<Vec<u8>, SphinxError> {
     let secp = secp256k1::Secp256k1::new();
     let (ephemeral_secret, ephemeral_pubkey) = secp.generate_keypair(&mut rand::rngs::OsRng);
     let shared_secret = ecdh(&ephemeral_secret, recipient_pubkey)?;
@@ -340,6 +371,9 @@ pub fn create_single_hop_onion(
     let mut final_payload = BytesMut::new();
     write_tlv_u64(&mut final_payload, 2, amount_msat);
     write_tlv_u64(&mut final_payload, 4, cltv_expiry as u64);
+    if short_channel_id != 0 {
+        write_tlv_u64(&mut final_payload, 6, short_channel_id);
+    }
     if let Some(secret) = payment_secret {
         write_bigsize(&mut final_payload, 8);
         write_bigsize(&mut final_payload, 32);

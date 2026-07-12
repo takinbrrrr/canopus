@@ -897,13 +897,12 @@ mod handler {
                     shared_secret,
                 )
                 .await?;
-            for _ in 0..600 {
+            loop {
                 if let Some(resolution) = cln_node.take_resolution(&result_key).await {
                     return Ok(resolution_to_json(resolution));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Ok(htlc_fail_temp_channel_failure())
         }
         .await;
         match result {

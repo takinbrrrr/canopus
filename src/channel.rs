@@ -12,6 +12,7 @@
 
 use crate::channel_id::{channel_id, hosted_short_channel_id};
 use crate::config::{ChannelPolicy, Config};
+use crate::ledger::{LedgerEventType, LedgerManager};
 use crate::node::{HtlcResolution, NodeActions, PaymentStatus};
 use crate::state::{StateError, StateManager};
 use crate::store::{ChannelData, ForwardLink, PendingUpdate, Store, StoreError};
@@ -23,6 +24,7 @@ use crate::wire::{
 };
 use bytes::Bytes;
 use secp256k1::{PublicKey, SecretKey};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -426,19 +428,17 @@ impl ChannelController {
         )
         .await?;
 
-        // Replay uncommitted local updates (re-numbered)
+        // Replay uncommitted local updates exactly as they are included in the
+        // persisted uncommitted state. The state_update below signs these ids.
         let mut sm = StateManager::new(data.lcss.clone());
         sm.uncommitted = data.uncommitted.clone();
 
-        let mut next_id = sm.next_local_updates() as u64 + 1;
         for update in &uncommitted_local {
             if let crate::store::UncommittedUpdate::Local(update) = update {
                 match update {
                     PendingUpdate::Add { htlc } => {
                         let mut htlc = htlc.clone();
                         htlc.channel_id = channel_id(&self.node_public, peer_id);
-                        htlc.id = next_id;
-                        next_id += 1;
                         self.send_message(peer_id, HostedMessage::UpdateAddHtlc(htlc))
                             .await?;
                     }
@@ -651,6 +651,19 @@ impl ChannelController {
         new_data.established = true;
         new_data.last_refund_scriptpubkey = data.last_refund_scriptpubkey.clone();
         self.save_channel(peer_id, &new_data, None).await?;
+        self.record_ledger_once(
+            peer_id,
+            format!(
+                "{}:{}:{}:open",
+                hex::encode(peer_id.serialize()),
+                lcss.local_updates,
+                lcss.remote_updates
+            ),
+            LedgerEventType::ChannelOpen,
+            lcss.remote_balance_msat,
+            None,
+        )
+        .await?;
 
         // Send our state_update back
         let state_update = StateUpdate {
@@ -675,25 +688,37 @@ impl ChannelController {
         data: ChannelData,
         msg: StateUpdate,
     ) -> ChannelResult<()> {
+        if data.uncommitted.is_empty() {
+            debug!("ignoring active state_update with no pending transition");
+            return Ok(());
+        }
+
         let mut sm = StateManager::new(data.lcss.clone());
         sm.uncommitted = data.uncommitted.clone();
 
         // Compute expected next state counters
         let expected_local = sm.next_local_updates();
         let expected_remote = sm.next_remote_updates();
+        let expected_peer_local = expected_remote;
+        let expected_peer_remote = expected_local;
 
         // Check if this state_update advances the state
-        if msg.local_updates < expected_local || msg.remote_updates < expected_remote {
+        if msg.local_updates < expected_peer_local || msg.remote_updates < expected_peer_remote {
             // Peer is behind — ignore
             debug!("state_update from peer is behind, ignoring");
             return Ok(());
         }
 
-        if msg.local_updates != expected_local || msg.remote_updates != expected_remote {
+        if msg.local_updates != expected_peer_local || msg.remote_updates != expected_peer_remote {
             // Counter mismatch
             debug!(
-                "state_update counter mismatch: expected local={} remote={}, got local={} remote={}",
-                expected_local, expected_remote, msg.local_updates, msg.remote_updates
+                "state_update counter mismatch: expected peer local={} peer remote={} (host local={} host remote={}), got local={} remote={}",
+                expected_peer_local,
+                expected_peer_remote,
+                expected_local,
+                expected_remote,
+                msg.local_updates,
+                msg.remote_updates
             );
             return Ok(());
         }
@@ -731,6 +756,8 @@ impl ChannelController {
         new_data.lcss = next.clone();
         new_data.uncommitted.clear();
         self.save_channel(peer_id, &new_data, None).await?;
+        self.record_committed_update_events(peer_id, &data.uncommitted, &data.lcss, &next)
+            .await?;
 
         // Send our state_update to confirm
         let state_update = StateUpdate {
@@ -743,7 +770,7 @@ impl ChannelController {
             .await?;
 
         // Dispatch committed side effects (relay HTLCs, etc.)
-        self.dispatch_committed_effects(peer_id, &data, &next)
+        self.dispatch_committed_effects(peer_id, &data, &data.uncommitted, &next)
             .await?;
 
         Ok(())
@@ -762,8 +789,8 @@ impl ChannelController {
             .ok_or(ChannelError::InvalidMessage("no proposed override".into()))?;
 
         // Check counters and block day match the proposal
-        if msg.local_updates != proposed.local_updates
-            || msg.remote_updates != proposed.remote_updates
+        if msg.local_updates != proposed.remote_updates
+            || msg.remote_updates != proposed.local_updates
         {
             debug!("override state_update counters don't match proposal");
             return Ok(());
@@ -797,6 +824,19 @@ impl ChannelController {
             accepting_resize_sat: data.accepting_resize_sat,
         };
         self.save_channel(peer_id, &new_data, None).await?;
+        self.record_ledger_once(
+            peer_id,
+            format!(
+                "{}:{}:{}:override",
+                hex::encode(peer_id.serialize()),
+                lcss.local_updates,
+                lcss.remote_updates
+            ),
+            LedgerEventType::Override,
+            lcss.local_balance_msat,
+            None,
+        )
+        .await?;
 
         // Send our state_update to confirm
         self.send_message(
@@ -853,56 +893,26 @@ impl ChannelController {
             return Ok(());
         }
 
-        // Validate HTLC parameters
-        let policy = &data.lcss.init_hosted_channel;
-        if htlc.amount_msat < policy.htlc_minimum_msat {
-            // Below minimum — fail leniently
-            return Ok(());
-        }
-
-        let peeled = match crate::sphinx::peel_onion(&self.node_secret, &htlc.onion_routing_packet)
-        {
-            Ok(peeled) => peeled,
-            Err(_) => return Ok(()),
-        };
-        let current_height = self.node.get_block_height().await.unwrap_or_default();
-        if peeled.outgoing_cltv_value < current_height.saturating_add(2) {
-            return Ok(());
-        }
-        let default_policy = self.effective_policy().await?;
-        let required_fee = (peeled.amt_to_forward / 1_000_000)
-            .saturating_mul(default_policy.fee_proportional_millionths as u64)
-            .saturating_add(default_policy.fee_base_msat as u64);
-        if htlc.amount_msat < peeled.amt_to_forward.saturating_add(required_fee) {
-            return Ok(());
-        }
-        if htlc.cltv_expiry
-            < peeled
-                .outgoing_cltv_value
-                .saturating_add(default_policy.cltv_expiry_delta as u32)
-        {
-            return Ok(());
-        }
-
-        // Check max accepted HTLCs
         let mut sm = StateManager::new(data.lcss.clone());
         sm.uncommitted = data.uncommitted.clone();
 
-        // Check balance: remote must have enough
         let next = sm.lcss_next()?;
         if htlc.amount_msat > next.remote_balance_msat {
-            // Insufficient balance — fail
-            return Ok(());
-        }
-
-        // Check max in-flight
-        let total_inflight: u64 = next
-            .incoming_htlcs
-            .iter()
-            .map(|h| h.amount_msat)
-            .sum::<u64>()
-            .saturating_add(htlc.amount_msat);
-        if total_inflight > policy.max_htlc_value_in_flight_msat {
+            self.mark_errored(
+                peer_id,
+                &data,
+                "peer sent update_add_htlc above available balance",
+            )
+            .await?;
+            self.send_message(
+                peer_id,
+                HostedMessage::Error(HcError {
+                    channel_id: channel_id(&self.node_public, peer_id),
+                    data: Bytes::from_static(b"update_add_htlc above available balance"),
+                    tlv_stream: Bytes::new(),
+                }),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -946,22 +956,6 @@ impl ChannelController {
                 },
             ));
         self.save_channel(peer_id, &new_data, None).await?;
-
-        let scid = hosted_short_channel_id(&self.node_public, peer_id);
-        let forward_key = Self::forward_key(scid, msg.id);
-        let key_ref: Vec<&str> = forward_key.iter().map(|s| s.as_str()).collect();
-        if let Ok((link, _)) =
-            crate::store::get_json::<crate::store::ForwardLink>(self.store.as_ref(), &key_ref).await
-        {
-            let result_key = format!("{}/{}", link.incoming_scid, link.incoming_htlc_id);
-            let mut failure = Vec::with_capacity(34);
-            failure.extend_from_slice(&msg.failure_code.to_be_bytes());
-            failure.extend_from_slice(&msg.sha256_of_onion);
-            let failure_onion = self.wrap_forward_failure(&link, &failure);
-            self.node
-                .resolve_htlc(&result_key, HtlcResolution::Fail { failure_onion })
-                .await?;
-        }
 
         Ok(())
     }
@@ -1022,20 +1016,8 @@ impl ChannelController {
                 ));
             self.save_channel(peer_id, &new_data, None).await?;
 
-            // Resolve the upstream HTLC immediately (guarantee our money)
-            // The forward link maps this outgoing HTLC to an incoming one
             let scid = hosted_short_channel_id(&self.node_public, peer_id);
-            let forward_key = Self::forward_key(scid, msg.id);
-            let key_ref: Vec<&str> = forward_key.iter().map(|s| s.as_str()).collect();
-            if let Ok((link, _)) =
-                crate::store::get_json::<crate::store::ForwardLink>(self.store.as_ref(), &key_ref)
-                    .await
-            {
-                let result_key = format!("{}/{}", link.incoming_scid, link.incoming_htlc_id);
-                self.node
-                    .resolve_htlc(&result_key, HtlcResolution::Resolve { preimage })
-                    .await?;
-            }
+            self.resolve_forward_fulfill(scid, msg.id, preimage).await?;
         }
 
         Ok(())
@@ -1076,20 +1058,6 @@ impl ChannelController {
                 },
             ));
         self.save_channel(peer_id, &new_data, None).await?;
-
-        // Resolve upstream HTLC with failure
-        let scid = hosted_short_channel_id(&self.node_public, peer_id);
-        let forward_key = Self::forward_key(scid, msg.id);
-        let key_ref: Vec<&str> = forward_key.iter().map(|s| s.as_str()).collect();
-        if let Ok((link, _)) =
-            crate::store::get_json::<crate::store::ForwardLink>(self.store.as_ref(), &key_ref).await
-        {
-            let result_key = format!("{}/{}", link.incoming_scid, link.incoming_htlc_id);
-            let failure_onion = self.wrap_forward_failure(&link, &msg.reason);
-            self.node
-                .resolve_htlc(&result_key, HtlcResolution::Fail { failure_onion })
-                .await?;
-        }
 
         Ok(())
     }
@@ -1191,6 +1159,20 @@ impl ChannelController {
         new_data.lcss.local_balance_msat = new_local_balance;
         new_data.lcss.sign(&self.node_secret)?;
         self.save_channel(peer_id, &new_data, None).await?;
+        self.record_ledger_once(
+            peer_id,
+            format!(
+                "{}:{}:{}:resize:{}",
+                hex::encode(peer_id.serialize()),
+                new_data.lcss.local_updates,
+                new_data.lcss.remote_updates,
+                new_capacity_msat
+            ),
+            LedgerEventType::Resize,
+            new_capacity_msat,
+            None,
+        )
+        .await?;
 
         self.send_message(
             peer_id,
@@ -1596,21 +1578,73 @@ impl ChannelController {
         &self,
         peer_id: &PublicKey,
         old_data: &ChannelData,
+        committed_updates: &[crate::store::UncommittedUpdate],
         new_lcss: &LastCrossSignedState,
     ) -> ChannelResult<()> {
         let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id);
-        for htlc in &new_lcss.outgoing_htlcs {
+        for htlc in &new_lcss.incoming_htlcs {
             if old_data
                 .lcss
-                .outgoing_htlcs
+                .incoming_htlcs
                 .iter()
                 .any(|old| old.htlc_id() == htlc.htlc_id())
             {
                 continue;
             }
 
-            let peeled = crate::sphinx::peel_onion(&self.node_secret, &htlc.onion_routing_packet)
-                .map_err(|e| ChannelError::InvalidMessage(e.to_string()))?;
+            let policy = &new_lcss.init_hosted_channel;
+            let total_htlcs = new_lcss.incoming_htlcs.len() + new_lcss.outgoing_htlcs.len();
+            let total_inflight = new_lcss
+                .incoming_htlcs
+                .iter()
+                .chain(new_lcss.outgoing_htlcs.iter())
+                .map(|h| h.amount_msat)
+                .sum::<u64>();
+            if htlc.amount_msat < policy.htlc_minimum_msat
+                || total_htlcs > policy.max_accepted_htlcs as usize
+                || total_inflight > policy.max_htlc_value_in_flight_msat
+            {
+                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                    .await?;
+                continue;
+            }
+
+            let peeled =
+                match crate::sphinx::peel_onion(&self.node_secret, &htlc.onion_routing_packet) {
+                    Ok(peeled) => peeled,
+                    Err(_) => {
+                        let onion_hash: [u8; 32] =
+                            sha2::Sha256::digest(&htlc.onion_routing_packet).into();
+                        self.send_local_fail_malformed_for_htlc(
+                            peer_id,
+                            htlc.htlc_id(),
+                            onion_hash,
+                            0xc005,
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+
+            let current_height = self.node.get_block_height().await.unwrap_or_default();
+            let default_policy = self.effective_policy().await?;
+            let required_fee = (peeled.amt_to_forward / 1_000_000)
+                .saturating_mul(default_policy.fee_proportional_millionths as u64)
+                .saturating_add(default_policy.fee_base_msat as u64);
+            if peeled.outgoing_cltv_value < current_height.saturating_add(2)
+                || htlc.amount_msat < peeled.amt_to_forward.saturating_add(required_fee)
+                || htlc.cltv_expiry
+                    < peeled
+                        .outgoing_cltv_value
+                        .saturating_add(default_policy.cltv_expiry_delta as u32)
+            {
+                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                    .await?;
+                continue;
+            }
+
             let outgoing_scid = peeled.short_channel_id;
             if let Some(target_peer) = self.peer_for_hosted_scid(outgoing_scid).await? {
                 if target_peer == *peer_id {
@@ -1675,6 +1709,29 @@ impl ChannelController {
                 )
                 .await?;
         }
+
+        for update in committed_updates {
+            match update {
+                crate::store::UncommittedUpdate::Remote(PendingUpdate::Fail {
+                    id, reason, ..
+                }) => {
+                    self.resolve_forward_fail(hosted_scid, *id, reason).await?;
+                }
+                crate::store::UncommittedUpdate::Remote(PendingUpdate::FailMalformed {
+                    id,
+                    sha256_of_onion,
+                    failure_code,
+                    ..
+                }) => {
+                    let mut failure = Vec::with_capacity(34);
+                    failure.extend_from_slice(&failure_code.to_be_bytes());
+                    failure.extend_from_slice(sha256_of_onion);
+                    self.resolve_forward_fail(hosted_scid, *id, &failure)
+                        .await?;
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -1685,6 +1742,214 @@ impl ChannelController {
             }
         }
         Ok(None)
+    }
+
+    async fn record_ledger_once(
+        &self,
+        peer_id: &PublicKey,
+        event_id: String,
+        event_type: LedgerEventType,
+        amount_msat: u64,
+        payment_hash: Option<&[u8; 32]>,
+    ) -> ChannelResult<()> {
+        let ledger = LedgerManager::new(self.store.clone());
+        ledger
+            .record_once(
+                &event_id,
+                &hex::encode(peer_id.serialize()),
+                event_type,
+                amount_msat,
+                0,
+                payment_hash,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn record_committed_update_events(
+        &self,
+        peer_id: &PublicKey,
+        committed_updates: &[crate::store::UncommittedUpdate],
+        old_lcss: &LastCrossSignedState,
+        new_lcss: &LastCrossSignedState,
+    ) -> ChannelResult<()> {
+        for update in committed_updates {
+            match update {
+                crate::store::UncommittedUpdate::Local(PendingUpdate::Add { htlc }) => {
+                    self.record_ledger_once(
+                        peer_id,
+                        format!(
+                            "{}:{}:{}:local-add:{}",
+                            hex::encode(peer_id.serialize()),
+                            new_lcss.local_updates,
+                            new_lcss.remote_updates,
+                            htlc.htlc_id()
+                        ),
+                        LedgerEventType::HtlcForwarded,
+                        htlc.amount_msat,
+                        Some(&htlc.payment_hash),
+                    )
+                    .await?;
+                }
+                crate::store::UncommittedUpdate::Remote(PendingUpdate::Add { htlc }) => {
+                    self.record_ledger_once(
+                        peer_id,
+                        format!(
+                            "{}:{}:{}:remote-add:{}",
+                            hex::encode(peer_id.serialize()),
+                            new_lcss.local_updates,
+                            new_lcss.remote_updates,
+                            htlc.htlc_id()
+                        ),
+                        LedgerEventType::HtlcForwarded,
+                        htlc.amount_msat,
+                        Some(&htlc.payment_hash),
+                    )
+                    .await?;
+                }
+                crate::store::UncommittedUpdate::Local(PendingUpdate::Fulfill { id, .. }) => {
+                    if let Some(htlc) = old_lcss.incoming_htlcs.iter().find(|h| h.htlc_id() == *id)
+                    {
+                        self.record_ledger_once(
+                            peer_id,
+                            format!(
+                                "{}:{}:{}:local-fulfill:{}",
+                                hex::encode(peer_id.serialize()),
+                                new_lcss.local_updates,
+                                new_lcss.remote_updates,
+                                id
+                            ),
+                            LedgerEventType::HtlcFulfilled,
+                            htlc.amount_msat,
+                            Some(&htlc.payment_hash),
+                        )
+                        .await?;
+                    }
+                }
+                crate::store::UncommittedUpdate::Remote(PendingUpdate::Fulfill { id, .. }) => {
+                    if let Some(htlc) = old_lcss.outgoing_htlcs.iter().find(|h| h.htlc_id() == *id)
+                    {
+                        self.record_ledger_once(
+                            peer_id,
+                            format!(
+                                "{}:{}:{}:remote-fulfill:{}",
+                                hex::encode(peer_id.serialize()),
+                                new_lcss.local_updates,
+                                new_lcss.remote_updates,
+                                id
+                            ),
+                            LedgerEventType::HtlcFulfilled,
+                            htlc.amount_msat,
+                            Some(&htlc.payment_hash),
+                        )
+                        .await?;
+                    }
+                }
+                crate::store::UncommittedUpdate::Local(PendingUpdate::Fail { id, .. })
+                | crate::store::UncommittedUpdate::Local(PendingUpdate::FailMalformed {
+                    id, ..
+                }) => {
+                    if let Some(htlc) = old_lcss.incoming_htlcs.iter().find(|h| h.htlc_id() == *id)
+                    {
+                        self.record_ledger_once(
+                            peer_id,
+                            format!(
+                                "{}:{}:{}:local-fail:{}",
+                                hex::encode(peer_id.serialize()),
+                                new_lcss.local_updates,
+                                new_lcss.remote_updates,
+                                id
+                            ),
+                            LedgerEventType::HtlcFailed,
+                            htlc.amount_msat,
+                            Some(&htlc.payment_hash),
+                        )
+                        .await?;
+                    }
+                }
+                crate::store::UncommittedUpdate::Remote(PendingUpdate::Fail { id, .. })
+                | crate::store::UncommittedUpdate::Remote(PendingUpdate::FailMalformed {
+                    id,
+                    ..
+                }) => {
+                    if let Some(htlc) = old_lcss.outgoing_htlcs.iter().find(|h| h.htlc_id() == *id)
+                    {
+                        self.record_ledger_once(
+                            peer_id,
+                            format!(
+                                "{}:{}:{}:remote-fail:{}",
+                                hex::encode(peer_id.serialize()),
+                                new_lcss.local_updates,
+                                new_lcss.remote_updates,
+                                id
+                            ),
+                            LedgerEventType::HtlcFailed,
+                            htlc.amount_msat,
+                            Some(&htlc.payment_hash),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_forward_fulfill(
+        &self,
+        outgoing_scid: u64,
+        outgoing_htlc_id: u64,
+        preimage: [u8; 32],
+    ) -> ChannelResult<()> {
+        let forward_key = Self::forward_key(outgoing_scid, outgoing_htlc_id);
+        let key_ref: Vec<&str> = forward_key.iter().map(|s| s.as_str()).collect();
+        let (link, _) =
+            match crate::store::get_json::<ForwardLink>(self.store.as_ref(), &key_ref).await {
+                Ok(link) => link,
+                Err(StoreError::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+
+        if let Some(source_peer) = self.peer_for_hosted_scid(link.incoming_scid).await? {
+            self.send_local_fulfill(&source_peer, &link, preimage)
+                .await?;
+        } else {
+            let result_key = format!("{}/{}", link.incoming_scid, link.incoming_htlc_id);
+            self.node
+                .resolve_htlc(&result_key, HtlcResolution::Resolve { preimage })
+                .await?;
+        }
+        let _ = self.store.delete(&key_ref).await;
+        Ok(())
+    }
+
+    async fn resolve_forward_fail(
+        &self,
+        outgoing_scid: u64,
+        outgoing_htlc_id: u64,
+        failure: &[u8],
+    ) -> ChannelResult<()> {
+        let forward_key = Self::forward_key(outgoing_scid, outgoing_htlc_id);
+        let key_ref: Vec<&str> = forward_key.iter().map(|s| s.as_str()).collect();
+        let (link, _) =
+            match crate::store::get_json::<ForwardLink>(self.store.as_ref(), &key_ref).await {
+                Ok(link) => link,
+                Err(StoreError::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+        let failure_onion = self.wrap_forward_failure(&link, failure);
+
+        if let Some(source_peer) = self.peer_for_hosted_scid(link.incoming_scid).await? {
+            self.send_local_fail(&source_peer, &link, failure_onion)
+                .await?;
+        } else {
+            let result_key = format!("{}/{}", link.incoming_scid, link.incoming_htlc_id);
+            self.node
+                .resolve_htlc(&result_key, HtlcResolution::Fail { failure_onion })
+                .await?;
+        }
+        let _ = self.store.delete(&key_ref).await;
+        Ok(())
     }
 
     pub async fn handle_outgoing_payment_result(
@@ -1858,6 +2123,99 @@ impl ChannelController {
                 channel_id: channel_id(&self.node_public, peer_id),
                 id: link.incoming_htlc_id,
                 reason,
+                tlv_stream: Bytes::new(),
+            }),
+        )
+        .await?;
+        self.send_message(peer_id, HostedMessage::StateUpdate(state_update))
+            .await?;
+        Ok(())
+    }
+
+    async fn send_local_fail_for_htlc(
+        &self,
+        peer_id: &PublicKey,
+        htlc_id: u64,
+        reason: Bytes,
+    ) -> ChannelResult<()> {
+        let data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        if !data
+            .lcss
+            .incoming_htlcs
+            .iter()
+            .any(|h| h.htlc_id() == htlc_id)
+        {
+            return Ok(());
+        }
+        let mut new_data = data.clone();
+        new_data
+            .uncommitted
+            .push(crate::store::UncommittedUpdate::Local(
+                PendingUpdate::Fail {
+                    channel_id: channel_id(&self.node_public, peer_id),
+                    id: htlc_id,
+                    reason: reason.clone(),
+                },
+            ));
+        let state_update = self.state_update_for_uncommitted(&new_data).await?;
+        self.save_channel(peer_id, &new_data, None).await?;
+        self.send_message(
+            peer_id,
+            HostedMessage::UpdateFailHtlc(crate::wire::UpdateFailHtlc {
+                channel_id: channel_id(&self.node_public, peer_id),
+                id: htlc_id,
+                reason,
+                tlv_stream: Bytes::new(),
+            }),
+        )
+        .await?;
+        self.send_message(peer_id, HostedMessage::StateUpdate(state_update))
+            .await?;
+        Ok(())
+    }
+
+    async fn send_local_fail_malformed_for_htlc(
+        &self,
+        peer_id: &PublicKey,
+        htlc_id: u64,
+        sha256_of_onion: [u8; 32],
+        failure_code: u16,
+    ) -> ChannelResult<()> {
+        let data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        if !data
+            .lcss
+            .incoming_htlcs
+            .iter()
+            .any(|h| h.htlc_id() == htlc_id)
+        {
+            return Ok(());
+        }
+        let mut new_data = data.clone();
+        new_data
+            .uncommitted
+            .push(crate::store::UncommittedUpdate::Local(
+                PendingUpdate::FailMalformed {
+                    channel_id: channel_id(&self.node_public, peer_id),
+                    id: htlc_id,
+                    sha256_of_onion,
+                    failure_code,
+                },
+            ));
+        let state_update = self.state_update_for_uncommitted(&new_data).await?;
+        self.save_channel(peer_id, &new_data, None).await?;
+        self.send_message(
+            peer_id,
+            HostedMessage::UpdateFailMalformedHtlc(crate::wire::UpdateFailMalformedHtlc {
+                channel_id: channel_id(&self.node_public, peer_id),
+                id: htlc_id,
+                sha256_of_onion,
+                failure_code,
                 tlv_stream: Bytes::new(),
             }),
         )

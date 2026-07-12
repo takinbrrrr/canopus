@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEvent {
     pub seq: u64,
+    #[serde(default)]
+    pub event_id: Option<String>,
     pub peer_pubkey: String,
     pub event_type: LedgerEventType,
     pub amount_msat: u64,
@@ -31,6 +33,8 @@ pub enum LedgerEventType {
     HtlcFailed,
     /// Channel state was overridden.
     Override,
+    /// Channel capacity was resized.
+    Resize,
     /// Fee earned.
     FeeEarned,
 }
@@ -53,6 +57,54 @@ impl LedgerManager {
         amount_msat: u64,
         fee_msat: u64,
         payment_hash: Option<&[u8; 32]>,
+    ) -> Result<(), crate::store::StoreError> {
+        self.record_inner(
+            peer_pubkey,
+            event_type,
+            amount_msat,
+            fee_msat,
+            payment_hash,
+            None,
+        )
+        .await
+    }
+
+    pub async fn record_once(
+        &self,
+        event_id: &str,
+        peer_pubkey: &str,
+        event_type: LedgerEventType,
+        amount_msat: u64,
+        fee_msat: u64,
+        payment_hash: Option<&[u8; 32]>,
+    ) -> Result<(), crate::store::StoreError> {
+        let marker_key = ["canopusd", "ledger_event_ids", event_id];
+        if self.store.exists(&marker_key).await? {
+            return Ok(());
+        }
+        self.record_inner(
+            peer_pubkey,
+            event_type,
+            amount_msat,
+            fee_msat,
+            payment_hash,
+            Some(event_id.to_string()),
+        )
+        .await?;
+        match crate::store::create_json(self.store.as_ref(), &marker_key, &true).await {
+            Ok(()) | Err(crate::store::StoreError::AlreadyExists(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn record_inner(
+        &self,
+        peer_pubkey: &str,
+        event_type: LedgerEventType,
+        amount_msat: u64,
+        fee_msat: u64,
+        payment_hash: Option<&[u8; 32]>,
+        event_id: Option<String>,
     ) -> Result<(), crate::store::StoreError> {
         // Get and increment the sequence number
         let meta_key = ["canopusd", "meta"];
@@ -80,6 +132,7 @@ impl LedgerManager {
 
         let event = LedgerEvent {
             seq,
+            event_id,
             peer_pubkey: peer_pubkey.to_string(),
             event_type,
             amount_msat,
