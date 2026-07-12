@@ -538,6 +538,72 @@ async fn test_htlc_add_to_active_channel() {
 }
 
 #[tokio::test]
+async fn test_remove_channel_without_inflight_htlcs() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+
+    controller
+        .remove_channel(&client_public, false)
+        .await
+        .unwrap();
+
+    assert!(controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::NotOpened
+    );
+    assert!(controller.list_channels().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_remove_channel_requires_force_with_inflight_htlcs() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+
+    let htlc = UpdateAddHtlc {
+        channel_id: [0u8; 32],
+        id: 0,
+        amount_msat: 10_000_000,
+        payment_hash: [1; 32],
+        cltv_expiry: 700_100,
+        onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
+    };
+    controller
+        .channel_handle_htlc_add(&client_public, htlc, "test-key", 1, 1, Some([9; 32]))
+        .await
+        .unwrap();
+
+    let err = controller
+        .remove_channel(&client_public, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("in-flight HTLCs"));
+
+    controller
+        .remove_channel(&client_public, true)
+        .await
+        .unwrap();
+
+    assert!(controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .is_none());
+    let hosted_scid = hosted_short_channel_id(&controller.node_public, &client_public).to_string();
+    assert!(controller
+        .store
+        .list(&["canopusd", "htlc_forwards", &hosted_scid])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn test_consecutive_htlc_adds_use_local_update_ids() {
     let (controller, node, client_secret, client_public) = make_harness(false).await;
     establish_channel(&controller, &node, &client_secret, &client_public).await;

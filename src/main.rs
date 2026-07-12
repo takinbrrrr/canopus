@@ -142,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
                 .description("Show the full persisted hosted-channel state for peerid, including the current status and channel data. Returns null if no channel is known for that peer."),
         )
         .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopusd-removehc", handler::handle_remove_hc)
+                .usage("peerid [force]")
+                .description("Remove the hosted channel for peerid. Refuses to remove channels with in-flight HTLCs or pending updates unless force=true or --force is passed."),
+        )
+        .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopusd-addsecret", handler::handle_add_secret)
                 .usage("secret capacity_msat initial_balance_msat")
                 .description("Create a one-time channel provisioning secret. A client invoking a hosted channel with this secret receives the supplied total channel capacity and initial client balance, both in millisatoshi."),
@@ -451,6 +456,17 @@ mod handler {
         }
         let s = value.as_str()?;
         s.strip_suffix("msat").unwrap_or(s).parse::<u64>().ok()
+    }
+
+    fn parse_force(value: Option<&Value>) -> bool {
+        match value {
+            Some(Value::Bool(force)) => *force,
+            Some(Value::String(force)) => {
+                matches!(force.as_str(), "true" | "1" | "force" | "--force")
+            }
+            Some(Value::Number(force)) => force.as_u64().is_some_and(|value| value != 0),
+            _ => false,
+        }
     }
 
     fn parse_32_hex(s: &str) -> Result<[u8; 32], cln_plugin::Error> {
@@ -1016,6 +1032,22 @@ mod handler {
             "short_channel_id": format_short_channel_id(short_channel_id),
             "data": data
         }))
+    }
+
+    pub async fn handle_remove_hc(
+        plugin: Plugin<PluginState>,
+        request: Value,
+    ) -> Result<Value, cln_plugin::Error> {
+        let peer = arg(&request, 0, "peerid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing peerid"))?;
+        let peer = parse_peer(peer)?;
+        let force = parse_force(param(&request, "force").or_else(|| arg(&request, 1, "force")));
+        controller(&plugin)
+            .await?
+            .remove_channel(&peer, force)
+            .await?;
+        Ok(json!({ "ok": true, "removed": true, "peer_id": peer.to_string(), "forced": force }))
     }
 
     pub async fn handle_add_secret(

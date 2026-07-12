@@ -51,6 +51,8 @@ pub enum ChannelError {
     InvalidMessage(String),
     #[error("block day out of range: got {got}, current {current}")]
     BlockDayOutOfRange { got: u32, current: u32 },
+    #[error("channel has in-flight HTLCs or pending updates; retry with force=true")]
+    InFlightHtlcs,
 }
 
 impl From<crate::wire::codecs::EncodeError> for ChannelError {
@@ -1903,6 +1905,39 @@ impl ChannelController {
             }
         }
         Ok(peers)
+    }
+
+    pub async fn remove_channel(&self, peer_id: &PublicKey, force: bool) -> ChannelResult<()> {
+        let data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        let mut sm = StateManager::new(data.lcss.clone());
+        sm.uncommitted = data.uncommitted.clone();
+        let next = sm.lcss_next()?;
+        if !force
+            && (!next.incoming_htlcs.is_empty()
+                || !next.outgoing_htlcs.is_empty()
+                || !data.uncommitted.is_empty())
+        {
+            return Err(ChannelError::InFlightHtlcs);
+        }
+
+        let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id).to_string();
+        for key in self
+            .store
+            .list(&["canopusd", "htlc_forwards", &hosted_scid])
+            .await?
+        {
+            let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+            self.store.delete(&key_ref).await?;
+        }
+
+        let key = Self::channel_key(peer_id);
+        let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+        self.store.delete(&key_ref).await?;
+        self.peer_wire_encodings.lock().await.remove(peer_id);
+        Ok(())
     }
 
     /// Handle an incoming HTLC add (from htlc_accepted hook).
