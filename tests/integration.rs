@@ -538,6 +538,56 @@ async fn test_htlc_add_to_active_channel() {
 }
 
 #[tokio::test]
+async fn test_consecutive_htlc_adds_use_local_update_ids() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+
+    for (index, payment_hash) in [[1u8; 32], [2u8; 32]].into_iter().enumerate() {
+        let htlc = UpdateAddHtlc {
+            channel_id: [0u8; 32],
+            id: 0,
+            amount_msat: 10_000_000,
+            payment_hash,
+            cltv_expiry: 700_100,
+            onion_routing_packet: Bytes::from(vec![0; 1366]),
+            tlv_stream: Bytes::new(),
+        };
+
+        controller
+            .channel_handle_htlc_add(
+                &client_public,
+                htlc,
+                &format!("test-key-{}", index + 1),
+                1,
+                index as u64 + 1,
+                Some([9; 32]),
+            )
+            .await
+            .unwrap();
+    }
+
+    let add_ids: Vec<_> = {
+        let sent = node.sent_messages.lock().unwrap();
+        sent.iter()
+            .filter_map(|(_, bytes)| match HostedMessage::decode(bytes) {
+                Ok(HostedMessage::UpdateAddHtlc(add)) => Some(add.id),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(add_ids, vec![1, 2]);
+
+    let hosted_scid = hosted_short_channel_id(&controller.node_public, &client_public);
+    let key = ChannelController::forward_key(hosted_scid, 2);
+    let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
+    let (link, _) = get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .unwrap();
+    assert_eq!(link.incoming_htlc_id, 2);
+    assert_eq!(link.outgoing_htlc_id, 2);
+}
+
+#[tokio::test]
 async fn test_hosted_fail_wraps_upstream_failure() {
     let (controller, node, client_secret, client_public) = make_harness(false).await;
     establish_channel(&controller, &node, &client_secret, &client_public).await;

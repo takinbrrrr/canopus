@@ -1986,7 +1986,7 @@ impl ChannelController {
         }
 
         // Assign HTLC id
-        let htlc_id = sm.next_remote_updates() as u64 + 1;
+        let htlc_id = sm.next_local_updates() as u64 + 1;
         let mut htlc = htlc;
         htlc.channel_id = channel_id(&self.node_public, peer_id);
         htlc.id = htlc_id;
