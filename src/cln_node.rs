@@ -4,15 +4,22 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cln_rpc::ClnRpc;
 use secp256k1::PublicKey;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::channel_id::parse_short_channel_id;
+use crate::channel_id::{format_short_channel_id, parse_short_channel_id};
 use crate::node::{HtlcResolution, NodeActions, NodeError, NodeInfo, NodeResult, PaymentStatus};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirstHop {
+    id: PublicKey,
+    channel: String,
+    direction: u32,
+}
 
 #[derive(Clone)]
 pub struct ClnNode {
@@ -46,32 +53,61 @@ impl ClnNode {
             .map_err(|e| NodeError::Rpc(e.message))
     }
 
-    async fn peer_for_scid(&self, scid: u64) -> NodeResult<PublicKey> {
-        let response = self.call("listpeers", json!({})).await?;
-        let peers = response
-            .get("peers")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| NodeError::Rpc("listpeers missing peers array".into()))?;
-        for peer in peers {
-            let Some(id) = peer.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(channels) = peer.get("channels").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for channel in channels {
-                let short_channel_id = channel
-                    .get("short_channel_id")
-                    .or_else(|| channel.get("alias"))
-                    .and_then(|v| v.as_str())
-                    .and_then(parse_short_channel_id);
-                if short_channel_id == Some(scid) {
-                    return PublicKey::from_str(id).map_err(|e| NodeError::Rpc(e.to_string()));
-                }
-            }
-        }
-        Err(NodeError::NotFound(format!("peer for scid {scid}")))
+    async fn first_hop_for_scid(&self, scid: u64) -> NodeResult<FirstHop> {
+        let scid_string = format_short_channel_id(scid);
+        let response = self
+            .call("listchannels", json!({ "short_channel_id": scid_string }))
+            .await?;
+        first_hop_from_listchannels(&self.node_id, scid, &response)
     }
+}
+
+fn first_hop_from_listchannels(
+    node_id: &PublicKey,
+    scid: u64,
+    response: &Value,
+) -> NodeResult<FirstHop> {
+    let channels = response
+        .get("channels")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| NodeError::Rpc("listchannels missing channels array".into()))?;
+    let node_id = node_id.to_string();
+    for channel in channels {
+        let short_channel_id = channel
+            .get("short_channel_id")
+            .and_then(|v| v.as_str())
+            .and_then(parse_short_channel_id);
+        if short_channel_id != Some(scid) {
+            continue;
+        }
+        if channel.get("source").and_then(|v| v.as_str()) != Some(node_id.as_str()) {
+            continue;
+        }
+        if channel.get("active").and_then(|v| v.as_bool()) == Some(false) {
+            continue;
+        }
+        let destination = channel
+            .get("destination")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| NodeError::Rpc("listchannels entry missing destination".into()))?;
+        let direction = channel
+            .get("direction")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| NodeError::Rpc("listchannels entry missing direction".into()))?;
+        let direction = u32::try_from(direction)
+            .map_err(|_| NodeError::Rpc("listchannels direction exceeds u32".into()))?;
+        let id = PublicKey::from_str(destination).map_err(|e| NodeError::Rpc(e.to_string()))?;
+        return Ok(FirstHop {
+            id,
+            channel: format_short_channel_id(scid),
+            direction,
+        });
+    }
+
+    Err(NodeError::NotFound(format!(
+        "active outgoing channel for scid {}",
+        format_short_channel_id(scid)
+    )))
 }
 
 #[async_trait]
@@ -99,7 +135,7 @@ impl NodeActions for ClnNode {
         group_id: u64,
         part_id: u64,
     ) -> NodeResult<()> {
-        let first_peer = self.peer_for_scid(first_scid).await?;
+        let first_hop = self.first_hop_for_scid(first_scid).await?;
         self.call(
             "sendonion",
             json!({
@@ -109,9 +145,12 @@ impl NodeActions for ClnNode {
                 "groupid": group_id,
                 "partid": part_id,
                 "first_hop": {
-                    "id": first_peer.to_string(),
+                    "id": first_hop.id.to_string(),
+                    "channel": first_hop.channel,
+                    "direction": first_hop.direction,
                     "amount_msat": format!("{first_amount_msat}msat"),
                     "delay": first_delay,
+                    "style": "tlv",
                 }
             }),
         )
@@ -263,5 +302,54 @@ impl NodeActions for ClnNode {
 
     async fn notify(&self, _notification: &str, _payload: serde_json::Value) -> NodeResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secp256k1::{Secp256k1, SecretKey};
+
+    fn pubkey(byte: u8) -> PublicKey {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[byte; 32]).unwrap();
+        PublicKey::from_secret_key(&secp, &secret)
+    }
+
+    #[test]
+    fn first_hop_uses_active_outgoing_listchannels_entry() {
+        let node = pubkey(1);
+        let peer = pubkey(2);
+        let scid = parse_short_channel_id("5061345x3x1").unwrap();
+        let response = json!({
+            "channels": [
+                {
+                    "source": peer.to_string(),
+                    "destination": node.to_string(),
+                    "short_channel_id": "5061345x3x1",
+                    "direction": 0,
+                    "active": true
+                },
+                {
+                    "source": node.to_string(),
+                    "destination": peer.to_string(),
+                    "short_channel_id": "5061345x3x1",
+                    "direction": 1,
+                    "active": false
+                },
+                {
+                    "source": node.to_string(),
+                    "destination": peer.to_string(),
+                    "short_channel_id": "5061345x3x1",
+                    "direction": 1,
+                    "active": true
+                }
+            ]
+        });
+
+        let first_hop = first_hop_from_listchannels(&node, scid, &response).unwrap();
+        assert_eq!(first_hop.id, peer);
+        assert_eq!(first_hop.channel, "5061345x3x1");
+        assert_eq!(first_hop.direction, 1);
     }
 }

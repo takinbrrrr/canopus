@@ -1467,6 +1467,80 @@ async fn test_hosted_origin_real_ln_ignores_host_fee_and_cltv_policy() {
 }
 
 #[tokio::test]
+async fn test_hosted_origin_sendonion_setup_failure_fails_htlc() {
+    let (controller, node, source_secret, source_public) = make_harness(false).await;
+    let secp = Secp256k1::new();
+    let (_, next_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &source_secret,
+        &source_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    node.sent_messages.lock().unwrap().clear();
+    node.fail_next_send_onion("peer for scid not found");
+
+    let payment_hash = [0x55u8; 32];
+    let real_scid = 5_061_345_003_001;
+    let amount_msat = 10_000_000;
+    let cltv_expiry = 700_100;
+    let source_htlc = UpdateAddHtlc {
+        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        id: 1,
+        amount_msat,
+        payment_hash,
+        cltv_expiry,
+        onion_routing_packet: Bytes::from(
+            canopusd::sphinx::create_relay_onion(
+                &controller.node_public,
+                &next_public,
+                real_scid,
+                amount_msat,
+                cltv_expiry,
+                &payment_hash,
+            )
+            .unwrap(),
+        ),
+        tlv_stream: Bytes::new(),
+    };
+
+    controller
+        .handle_update_add(&source_public, source_htlc)
+        .await
+        .unwrap();
+    commit_peer_updates(&controller, &source_public, &source_secret).await;
+
+    assert!(node.sent_onions.lock().unwrap().is_empty());
+    let source_fail = {
+        let sent = node.sent_messages.lock().unwrap();
+        sent.iter().rev().find_map(|(peer, bytes)| {
+            if peer == &source_public {
+                match HostedMessage::decode(bytes).unwrap() {
+                    HostedMessage::UpdateFailHtlc(fail) => Some(fail),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    };
+    assert!(matches!(
+        source_fail,
+        Some(UpdateFailHtlc { id: 1, reason, .. }) if reason.len() == 256
+    ));
+    let key = ChannelController::forward_key(real_scid, 1);
+    let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
+    assert!(get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn test_hosted_to_hosted_still_enforces_host_policy() {
     let (controller, node, source_secret, source_public) = make_harness(false).await;
     let secp = Secp256k1::new();

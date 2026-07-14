@@ -118,6 +118,7 @@ pub struct MockNode {
     pub htlc_resolutions: std::sync::Mutex<Vec<(String, HtlcResolution)>>,
     pub notifications: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
     pub payment_results: std::sync::Mutex<HashMap<String, PaymentStatus>>,
+    pub send_onion_error: std::sync::Mutex<Option<String>>,
     pub node_info: std::sync::Mutex<Option<NodeInfo>>,
     pub raw_blocks: std::sync::Mutex<HashMap<u32, String>>,
 }
@@ -150,6 +151,7 @@ impl MockNode {
             htlc_resolutions: std::sync::Mutex::new(Vec::new()),
             notifications: std::sync::Mutex::new(Vec::new()),
             payment_results: std::sync::Mutex::new(HashMap::new()),
+            send_onion_error: std::sync::Mutex::new(None),
             node_info: std::sync::Mutex::new(Some(info)),
             raw_blocks: std::sync::Mutex::new(HashMap::new()),
         }
@@ -165,6 +167,10 @@ impl MockNode {
             .lock()
             .unwrap()
             .insert(label.to_string(), status);
+    }
+
+    pub fn fail_next_send_onion(&self, message: impl Into<String>) {
+        *self.send_onion_error.lock().unwrap() = Some(message.into());
     }
 
     pub fn set_raw_block(&self, height: u32, block_hex: String) {
@@ -193,6 +199,9 @@ impl NodeActions for MockNode {
         group_id: u64,
         part_id: u64,
     ) -> NodeResult<()> {
+        if let Some(message) = self.send_onion_error.lock().unwrap().take() {
+            return Err(NodeError::Rpc(message));
+        }
         self.sent_onions.lock().unwrap().push(SendOnionParams {
             onion,
             payment_hash,

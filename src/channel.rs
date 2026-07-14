@@ -1974,7 +1974,8 @@ impl ChannelController {
                 .saturating_sub(1)
                 .min(u16::MAX as u32) as u16;
             let label = format!("{outgoing_scid}/{outgoing_htlc_id}");
-            self.node
+            if self
+                .node
                 .send_onion(
                     Bytes::from(peeled.next_onion),
                     htlc.payment_hash,
@@ -1985,7 +1986,15 @@ impl ChannelController {
                     outgoing_scid / 100,
                     outgoing_htlc_id,
                 )
-                .await?;
+                .await
+                .is_err()
+            {
+                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                    .await?;
+                let _ = self.store.delete(&key_ref).await;
+                continue;
+            }
         }
 
         for update in committed_updates {
