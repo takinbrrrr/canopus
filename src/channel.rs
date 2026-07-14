@@ -1610,22 +1610,25 @@ impl ChannelController {
                 continue;
             }
 
-            let peeled =
-                match crate::sphinx::peel_onion(&self.node_secret, &htlc.onion_routing_packet) {
-                    Ok(peeled) => peeled,
-                    Err(_) => {
-                        let onion_hash: [u8; 32] =
-                            sha2::Sha256::digest(&htlc.onion_routing_packet).into();
-                        self.send_local_fail_malformed_for_htlc(
-                            peer_id,
-                            htlc.htlc_id(),
-                            onion_hash,
-                            0xc005,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
+            let peeled = match crate::sphinx::peel_onion(
+                &self.node_secret,
+                &htlc.onion_routing_packet,
+                &htlc.payment_hash,
+            ) {
+                Ok(peeled) => peeled,
+                Err(_) => {
+                    let onion_hash: [u8; 32] =
+                        sha2::Sha256::digest(&htlc.onion_routing_packet).into();
+                    self.send_local_fail_malformed_for_htlc(
+                        peer_id,
+                        htlc.htlc_id(),
+                        onion_hash,
+                        0xc005,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
 
             let current_height = self.node.get_block_height().await.unwrap_or_default();
             let default_policy = self.effective_policy().await?;
@@ -2016,6 +2019,7 @@ impl ChannelController {
             amount_msat,
             final_cltv_expiry,
             payment_secret,
+            &payment_hash,
         )
         .map_err(|e| ChannelError::InvalidMessage(e.to_string()))?;
         let htlc = UpdateAddHtlc {
@@ -2437,7 +2441,11 @@ impl ChannelController {
     fn failure_onion_for_peer_htlc(&self, htlc: &UpdateAddHtlc, failure_code: u16) -> Bytes {
         let mut failure = Vec::with_capacity(2);
         failure.extend_from_slice(&failure_code.to_be_bytes());
-        match crate::sphinx::peel_onion(&self.node_secret, &htlc.onion_routing_packet) {
+        match crate::sphinx::peel_onion(
+            &self.node_secret,
+            &htlc.onion_routing_packet,
+            &htlc.payment_hash,
+        ) {
             Ok(peeled) => Bytes::from(crate::sphinx::wrap_failure(&peeled.shared_secret, &failure)),
             Err(_) => Bytes::from(failure),
         }

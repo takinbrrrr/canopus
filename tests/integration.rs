@@ -685,8 +685,14 @@ async fn test_state_update_accepts_client_view_counters() {
         payment_hash: [1; 32],
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_single_hop_onion(&client_public, 10_000_000, 700_100, None)
-                .unwrap(),
+            canopusd::sphinx::create_single_hop_onion(
+                &client_public,
+                10_000_000,
+                700_100,
+                None,
+                &[1; 32],
+            )
+            .unwrap(),
         ),
         tlv_stream: Bytes::new(),
     };
@@ -781,8 +787,14 @@ async fn test_fulfill_after_client_view_state_update_resolves_upstream() {
         payment_hash,
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_single_hop_onion(&client_public, 10_000_000, 700_100, None)
-                .unwrap(),
+            canopusd::sphinx::create_single_hop_onion(
+                &client_public,
+                10_000_000,
+                700_100,
+                None,
+                &payment_hash,
+            )
+            .unwrap(),
         ),
         tlv_stream: Bytes::new(),
     };
@@ -1092,9 +1104,11 @@ async fn test_hosted_to_hosted_fulfill_returns_to_source_peer() {
         onion_routing_packet: Bytes::from(
             canopusd::sphinx::create_relay_onion(
                 &controller.node_public,
+                &target_public,
                 target_scid,
                 target_amount,
                 target_cltv,
+                &payment_hash,
             )
             .unwrap(),
         ),
@@ -1231,9 +1245,11 @@ async fn test_hosted_to_hosted_fail_returns_to_source_peer() {
         onion_routing_packet: Bytes::from(
             canopusd::sphinx::create_relay_onion(
                 &controller.node_public,
+                &target_public,
                 target_scid,
                 10_000_000,
                 700_100,
+                &payment_hash,
             )
             .unwrap(),
         ),
@@ -1570,8 +1586,8 @@ async fn test_sphinx_key_derivation() {
 
     // Different keys should produce different ECDH results
     let _pk1 = secp256k1::PublicKey::from_secret_key(&secp, &sk1);
-    let r1 = canopusd::sphinx::peel_onion(&sk1, &[0u8; 1366]);
-    let r2 = canopusd::sphinx::peel_onion(&sk2, &[0u8; 1366]);
+    let r1 = canopusd::sphinx::peel_onion(&sk1, &[0u8; 1366], &[0u8; 32]);
+    let r2 = canopusd::sphinx::peel_onion(&sk2, &[0u8; 1366], &[0u8; 32]);
     // Both should fail (invalid onion) but not panic
     assert!(r1.is_err());
     assert!(r2.is_err());

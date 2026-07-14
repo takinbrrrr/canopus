@@ -222,8 +222,9 @@ impl HtlcManager {
     pub fn peel_client_onion(
         &self,
         onion: &[u8],
+        payment_hash: &[u8; 32],
     ) -> Result<sphinx::PeeledOnion, sphinx::SphinxError> {
-        sphinx::peel_onion(&self.controller.node_secret, onion)
+        sphinx::peel_onion(&self.controller.node_secret, onion, payment_hash)
     }
 }
 
