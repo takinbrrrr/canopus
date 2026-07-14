@@ -76,6 +76,31 @@ pub struct ChannelData {
     /// Maximum channel capacity in satoshis the host will accept in a client resize proposal.
     #[serde(default)]
     pub accepting_resize_sat: Option<u64>,
+    /// Per-channel routing policy not covered by the cross-signed state.
+    #[serde(default)]
+    pub routing_policy: Option<ChannelRoutingPolicy>,
+    /// A channel_update should be sent to the peer when possible.
+    #[serde(default)]
+    pub channel_update_pending: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelRoutingPolicy {
+    pub fee_base_msat: u32,
+    pub fee_proportional_millionths: u32,
+    pub cltv_expiry_delta: u16,
+    pub htlc_maximum_msat: u64,
+}
+
+impl ChannelRoutingPolicy {
+    pub fn from_policy(policy: &crate::config::ChannelPolicy) -> Self {
+        Self {
+            fee_base_msat: policy.fee_base_msat,
+            fee_proportional_millionths: policy.fee_proportional_millionths,
+            cltv_expiry_delta: policy.cltv_expiry_delta,
+            htlc_maximum_msat: policy.channel_capacity_msat,
+        }
+    }
 }
 
 /// An uncommitted update pending a state_update exchange.
@@ -576,6 +601,8 @@ mod tests {
             last_refund_scriptpubkey: Bytes::from_static(&[0x00]),
             established: true,
             accepting_resize_sat: None,
+            routing_policy: None,
+            channel_update_pending: false,
         };
 
         create_json(&store, &key, &data).await.unwrap();

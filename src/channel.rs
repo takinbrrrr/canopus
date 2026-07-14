@@ -15,7 +15,9 @@ use crate::config::{ChannelPolicy, Config};
 use crate::ledger::{LedgerEventType, LedgerManager};
 use crate::node::{HtlcResolution, NodeActions, PaymentStatus};
 use crate::state::{StateError, StateManager};
-use crate::store::{ChannelData, ForwardLink, PendingUpdate, Store, StoreError};
+use crate::store::{
+    ChannelData, ChannelRoutingPolicy, ForwardLink, PendingUpdate, Store, StoreError,
+};
 use crate::wire::codecs::UpdateAddHtlc;
 use crate::wire::lcss::{InitHostedChannel, LastCrossSignedState};
 use crate::wire::{
@@ -80,6 +82,55 @@ pub enum Status {
     Overriding,
     /// Channel is administratively suspended.
     Suspended,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SetChannelParams {
+    pub channel_capacity_msat: Option<u64>,
+    pub initial_client_balance_msat: Option<u64>,
+    pub fee_base_msat: Option<u32>,
+    pub fee_proportional_millionths: Option<u32>,
+    pub cltv_expiry_delta: Option<u16>,
+    pub htlc_minimum_msat: Option<u64>,
+    pub htlc_maximum_msat: Option<u64>,
+    pub max_accepted_htlcs: Option<u16>,
+}
+
+impl SetChannelParams {
+    pub fn is_empty(&self) -> bool {
+        self.channel_capacity_msat.is_none()
+            && self.initial_client_balance_msat.is_none()
+            && self.fee_base_msat.is_none()
+            && self.fee_proportional_millionths.is_none()
+            && self.cltv_expiry_delta.is_none()
+            && self.htlc_minimum_msat.is_none()
+            && self.htlc_maximum_msat.is_none()
+            && self.max_accepted_htlcs.is_none()
+    }
+
+    fn affects_lcss(&self) -> bool {
+        self.channel_capacity_msat.is_some()
+            || self.initial_client_balance_msat.is_some()
+            || self.htlc_minimum_msat.is_some()
+            || self.max_accepted_htlcs.is_some()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelParameters {
+    pub channel_capacity_msat: u64,
+    pub initial_client_balance_msat: u64,
+    pub local_balance_msat: u64,
+    pub remote_balance_msat: u64,
+    pub max_htlc_value_in_flight_msat: u64,
+    pub htlc_minimum_msat: u64,
+    pub htlc_maximum_msat: u64,
+    pub maxhtlcs: u16,
+    pub feebase_msat: u32,
+    pub feeppm: u32,
+    pub cltv_expiry_delta: u16,
+    pub channel_update_pending: bool,
+    pub override_pending: bool,
 }
 
 impl std::fmt::Display for Status {
@@ -268,6 +319,42 @@ impl ChannelController {
         }
     }
 
+    async fn routing_policy_for_data(
+        &self,
+        data: &ChannelData,
+    ) -> ChannelResult<ChannelRoutingPolicy> {
+        match &data.routing_policy {
+            Some(policy) => Ok(policy.clone()),
+            None => Ok(ChannelRoutingPolicy::from_policy(
+                &self.effective_policy().await?,
+            )),
+        }
+    }
+
+    async fn channel_parameters_for_data(
+        &self,
+        data: &ChannelData,
+    ) -> ChannelResult<ChannelParameters> {
+        let lcss = data.proposed_override.as_ref().unwrap_or(&data.lcss);
+        let init = &lcss.init_hosted_channel;
+        let routing = self.routing_policy_for_data(data).await?;
+        Ok(ChannelParameters {
+            channel_capacity_msat: init.channel_capacity_msat,
+            initial_client_balance_msat: init.initial_client_balance_msat,
+            local_balance_msat: lcss.local_balance_msat,
+            remote_balance_msat: lcss.remote_balance_msat,
+            max_htlc_value_in_flight_msat: init.max_htlc_value_in_flight_msat,
+            htlc_minimum_msat: init.htlc_minimum_msat,
+            htlc_maximum_msat: routing.htlc_maximum_msat,
+            maxhtlcs: init.max_accepted_htlcs,
+            feebase_msat: routing.fee_base_msat,
+            feeppm: routing.fee_proportional_millionths,
+            cltv_expiry_delta: routing.cltv_expiry_delta,
+            channel_update_pending: data.channel_update_pending,
+            override_pending: data.proposed_override.is_some(),
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Channel establishment
     // -----------------------------------------------------------------------
@@ -398,6 +485,8 @@ impl ChannelController {
             last_refund_scriptpubkey: msg.refund_scriptpubkey,
             established: false,
             accepting_resize_sat: None,
+            routing_policy: Some(ChannelRoutingPolicy::from_policy(&policy)),
+            channel_update_pending: false,
         };
         self.save_channel(peer_id, &data, None).await?;
 
@@ -514,6 +603,8 @@ impl ChannelController {
             )
             .await?;
         }
+
+        self.send_pending_channel_update(peer_id).await?;
 
         Ok(())
     }
@@ -822,6 +913,8 @@ impl ChannelController {
             last_refund_scriptpubkey: data.last_refund_scriptpubkey.clone(),
             established: true,
             accepting_resize_sat: data.accepting_resize_sat,
+            routing_policy: data.routing_policy.clone(),
+            channel_update_pending: data.channel_update_pending,
         };
         self.save_channel(peer_id, &new_data, None).await?;
         self.record_ledger_once(
@@ -850,8 +943,11 @@ impl ChannelController {
         )
         .await?;
 
-        // Send channel_update
-        self.send_channel_update(peer_id).await?;
+        if data.channel_update_pending {
+            self.send_pending_channel_update(peer_id).await?;
+        } else {
+            self.send_channel_update(peer_id).await?;
+        }
 
         debug!(
             "channel override accepted for {}",
@@ -1157,6 +1253,10 @@ impl ChannelController {
             .init_hosted_channel
             .max_htlc_value_in_flight_msat = new_capacity_msat;
         new_data.lcss.local_balance_msat = new_local_balance;
+        let mut routing = self.routing_policy_for_data(&data).await?;
+        routing.htlc_maximum_msat = new_capacity_msat;
+        new_data.routing_policy = Some(routing);
+        new_data.channel_update_pending = true;
         new_data.lcss.sign(&self.node_secret)?;
         self.save_channel(peer_id, &new_data, None).await?;
         self.record_ledger_once(
@@ -1184,6 +1284,9 @@ impl ChannelController {
             }),
         )
         .await?;
+        if let Err(err) = self.send_pending_channel_update(peer_id).await {
+            warn!(%peer_id, error_message = %err, "failed to send channel_update after resize");
+        }
         Ok(())
     }
 
@@ -1201,6 +1304,148 @@ impl ChannelController {
         })
         .await?;
         Ok(())
+    }
+
+    pub async fn set_channel(
+        &self,
+        peer_id: &PublicKey,
+        params: SetChannelParams,
+    ) -> ChannelResult<(ChannelParameters, bool)> {
+        let data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        if params.is_empty() {
+            return Ok((self.channel_parameters_for_data(&data).await?, false));
+        }
+
+        if derive_status(&data) != Status::Active {
+            return Err(ChannelError::InvalidMessage(
+                "can only update active channels".into(),
+            ));
+        }
+        if !data.lcss.incoming_htlcs.is_empty()
+            || !data.lcss.outgoing_htlcs.is_empty()
+            || !data.uncommitted.is_empty()
+        {
+            return Err(ChannelError::InvalidMessage(
+                "cannot update channel with in-flight HTLCs".into(),
+            ));
+        }
+
+        let mut routing = self.routing_policy_for_data(&data).await?;
+        if let Some(v) = params.fee_base_msat {
+            routing.fee_base_msat = v;
+        }
+        if let Some(v) = params.fee_proportional_millionths {
+            routing.fee_proportional_millionths = v;
+        }
+        if let Some(v) = params.cltv_expiry_delta {
+            routing.cltv_expiry_delta = v;
+        }
+        if let Some(v) = params.htlc_maximum_msat {
+            routing.htlc_maximum_msat = v;
+        }
+
+        let mut new_data = data.clone();
+        new_data.routing_policy = Some(routing.clone());
+        new_data.channel_update_pending = true;
+
+        if params.affects_lcss() {
+            let mut init = data.lcss.init_hosted_channel.clone();
+            if let Some(v) = params.channel_capacity_msat {
+                init.channel_capacity_msat = v;
+                init.max_htlc_value_in_flight_msat = v;
+            }
+            if let Some(v) = params.initial_client_balance_msat {
+                init.initial_client_balance_msat = v;
+            }
+            if let Some(v) = params.htlc_minimum_msat {
+                init.htlc_minimum_msat = v;
+            }
+            if let Some(v) = params.max_accepted_htlcs {
+                init.max_accepted_htlcs = v;
+            }
+            if init.initial_client_balance_msat > init.channel_capacity_msat {
+                return Err(ChannelError::InvalidMessage(
+                    "initial_client_balance_msat exceeds channel_capacity_msat".into(),
+                ));
+            }
+
+            let remote_balance = params
+                .initial_client_balance_msat
+                .unwrap_or(data.lcss.remote_balance_msat);
+            let local_balance = init
+                .channel_capacity_msat
+                .checked_sub(remote_balance)
+                .ok_or(ChannelError::InvalidMessage(
+                    "client balance exceeds channel capacity".into(),
+                ))?;
+            if routing.htlc_maximum_msat > init.channel_capacity_msat {
+                return Err(ChannelError::InvalidMessage(
+                    "htlc_maximum_msat exceeds channel_capacity_msat".into(),
+                ));
+            }
+            if init.htlc_minimum_msat > routing.htlc_maximum_msat {
+                return Err(ChannelError::InvalidMessage(
+                    "htlc_minimum_msat exceeds htlc_maximum_msat".into(),
+                ));
+            }
+
+            let mut override_lcss = LastCrossSignedState {
+                is_host: true,
+                last_refund_scriptpubkey: data.last_refund_scriptpubkey.clone(),
+                init_hosted_channel: init,
+                block_day: self.current_block_day().await?,
+                local_balance_msat: local_balance,
+                remote_balance_msat: remote_balance,
+                local_updates: data.lcss.local_updates + 1,
+                remote_updates: data.lcss.remote_updates + 1,
+                incoming_htlcs: vec![],
+                outgoing_htlcs: vec![],
+                remote_sig_of_local: [0; 64],
+                local_sig_of_remote: [0; 64],
+            };
+            override_lcss.sign(&self.node_secret)?;
+            new_data.proposed_override = Some(override_lcss.clone());
+            self.save_channel(peer_id, &new_data, None).await?;
+            if let Err(err) = self
+                .send_message(
+                    peer_id,
+                    HostedMessage::StateOverride(StateOverride {
+                        block_day: override_lcss.block_day,
+                        local_balance_msat: override_lcss.local_balance_msat,
+                        local_updates: override_lcss.local_updates,
+                        remote_updates: override_lcss.remote_updates,
+                        local_sig_of_remote: override_lcss.local_sig_of_remote,
+                    }),
+                )
+                .await
+            {
+                warn!(%peer_id, error_message = %err, "failed to send pending setchannel state_override");
+            }
+        } else {
+            if routing.htlc_maximum_msat > data.lcss.init_hosted_channel.channel_capacity_msat {
+                return Err(ChannelError::InvalidMessage(
+                    "htlc_maximum_msat exceeds channel_capacity_msat".into(),
+                ));
+            }
+            if data.lcss.init_hosted_channel.htlc_minimum_msat > routing.htlc_maximum_msat {
+                return Err(ChannelError::InvalidMessage(
+                    "htlc_minimum_msat exceeds htlc_maximum_msat".into(),
+                ));
+            }
+            self.save_channel(peer_id, &new_data, None).await?;
+            if let Err(err) = self.send_pending_channel_update(peer_id).await {
+                warn!(%peer_id, error_message = %err, "failed to send pending setchannel channel_update");
+            }
+        }
+
+        let data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        Ok((self.channel_parameters_for_data(&data).await?, true))
     }
 
     // -----------------------------------------------------------------------
@@ -1538,7 +1783,7 @@ impl ChannelController {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as u32;
-        let policy = self.effective_policy().await?;
+        let routing = self.routing_policy_for_data(&data).await?;
         let phc = crate::gossip::phc_channel_update_sync(
             &self.node_secret,
             &self.node_public,
@@ -1556,10 +1801,11 @@ impl ChannelController {
                     .max_htlc_value_in_flight_msat,
                 htlc_minimum_msat: data.lcss.init_hosted_channel.htlc_minimum_msat,
                 max_accepted_htlcs: data.lcss.init_hosted_channel.max_accepted_htlcs,
-                fee_base_msat: policy.fee_base_msat,
-                fee_proportional_millionths: policy.fee_proportional_millionths,
-                cltv_expiry_delta: policy.cltv_expiry_delta,
+                fee_base_msat: routing.fee_base_msat,
+                fee_proportional_millionths: routing.fee_proportional_millionths,
+                cltv_expiry_delta: routing.cltv_expiry_delta,
             },
+            routing.htlc_maximum_msat,
             derive_status(&data) == Status::Active,
             timestamp,
         );
@@ -1570,6 +1816,25 @@ impl ChannelController {
                 HostedMessage::PhcChannelUpdate(phc).encode_with_encoding(encoding)?,
             )
             .await?;
+        Ok(())
+    }
+
+    async fn send_pending_channel_update(&self, peer_id: &PublicKey) -> ChannelResult<()> {
+        let data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        if !data.channel_update_pending {
+            return Ok(());
+        }
+
+        self.send_channel_update(peer_id).await?;
+        let mut new_data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        new_data.channel_update_pending = false;
+        self.save_channel(peer_id, &new_data, None).await?;
         Ok(())
     }
 
@@ -1630,18 +1895,7 @@ impl ChannelController {
                 }
             };
 
-            let current_height = self.node.get_block_height().await.unwrap_or_default();
-            let default_policy = self.effective_policy().await?;
-            let required_fee = (peeled.amt_to_forward / 1_000_000)
-                .saturating_mul(default_policy.fee_proportional_millionths as u64)
-                .saturating_add(default_policy.fee_base_msat as u64);
-            if peeled.outgoing_cltv_value < current_height.saturating_add(2)
-                || htlc.amount_msat < peeled.amt_to_forward.saturating_add(required_fee)
-                || htlc.cltv_expiry
-                    < peeled
-                        .outgoing_cltv_value
-                        .saturating_add(default_policy.cltv_expiry_delta as u32)
-            {
+            if htlc.amount_msat < peeled.amt_to_forward {
                 let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
                 self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
                     .await?;
@@ -1654,6 +1908,27 @@ impl ChannelController {
                     return Err(ChannelError::InvalidMessage(
                         "cannot forward hosted HTLC back to same channel".into(),
                     ));
+                }
+                let target_data = self
+                    .load_channel(&target_peer)
+                    .await?
+                    .ok_or(ChannelError::NotFound(hex::encode(target_peer.serialize())))?;
+                let target_routing = self.routing_policy_for_data(&target_data).await?;
+                let current_height = self.node.get_block_height().await.unwrap_or_default();
+                let required_fee = (peeled.amt_to_forward / 1_000_000)
+                    .saturating_mul(target_routing.fee_proportional_millionths as u64)
+                    .saturating_add(target_routing.fee_base_msat as u64);
+                if peeled.outgoing_cltv_value < current_height.saturating_add(2)
+                    || htlc.amount_msat < peeled.amt_to_forward.saturating_add(required_fee)
+                    || htlc.cltv_expiry
+                        < peeled
+                            .outgoing_cltv_value
+                            .saturating_add(target_routing.cltv_expiry_delta as u32)
+                {
+                    let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+                    self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                        .await?;
+                    continue;
                 }
                 let outgoing_htlc = UpdateAddHtlc {
                     channel_id: channel_id(&self.node_public, &target_peer),
@@ -2332,12 +2607,25 @@ impl ChannelController {
 
         // Validate HTLC parameters
         let policy = &data.lcss.init_hosted_channel;
+        let routing = self.routing_policy_for_data(&data).await?;
         if htlc.amount_msat < policy.htlc_minimum_msat {
             self.node
                 .resolve_htlc(
                     result_key,
                     HtlcResolution::FailMessage {
                         code: 0x400e, // amount_below_minimum
+                        data: Bytes::new(),
+                    },
+                )
+                .await?;
+            return Ok(());
+        }
+        if htlc.amount_msat > routing.htlc_maximum_msat {
+            self.node
+                .resolve_htlc(
+                    result_key,
+                    HtlcResolution::FailMessage {
+                        code: 0x1007,
                         data: Bytes::new(),
                     },
                 )
@@ -2363,9 +2651,24 @@ impl ChannelController {
         }
 
         // Check max in-flight
+        let total_htlcs = next.incoming_htlcs.len() + next.outgoing_htlcs.len() + 1;
+        if total_htlcs > policy.max_accepted_htlcs as usize {
+            self.node
+                .resolve_htlc(
+                    result_key,
+                    HtlcResolution::FailMessage {
+                        code: 0x1007,
+                        data: Bytes::new(),
+                    },
+                )
+                .await?;
+            return Ok(());
+        }
+
         let total_inflight: u64 = next
             .incoming_htlcs
             .iter()
+            .chain(next.outgoing_htlcs.iter())
             .map(|h| h.amount_msat)
             .sum::<u64>()
             .saturating_add(htlc.amount_msat);
@@ -2466,6 +2769,16 @@ impl ChannelController {
         peer_id: &PublicKey,
     ) -> ChannelResult<Option<ChannelData>> {
         self.load_channel(peer_id).await
+    }
+
+    pub async fn handle_connect(&self, peer_id: &PublicKey) -> ChannelResult<()> {
+        let Some(data) = self.load_channel(peer_id).await? else {
+            return Ok(());
+        };
+        if derive_status(&data) == Status::Active && data.channel_update_pending {
+            self.send_pending_channel_update(peer_id).await?;
+        }
+        Ok(())
     }
 
     /// Handle a disconnect notification.

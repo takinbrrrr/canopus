@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
-use canopusd::channel::{ChannelController, Status};
+use canopusd::channel::{ChannelController, SetChannelParams, Status};
 use canopusd::channel_id::hosted_short_channel_id;
 use canopusd::config::Config;
 use canopusd::node::{HtlcResolution, MockNode, NodeActions};
@@ -198,6 +198,30 @@ async fn establish_channel_with_secret(
         .unwrap()
         .unwrap()
         .lcss
+}
+
+async fn commit_peer_updates(
+    controller: &ChannelController,
+    peer_public: &PublicKey,
+    peer_secret: &SecretKey,
+) {
+    let data = controller.load_channel(peer_public).await.unwrap().unwrap();
+    let mut sm = StateManager::new(data.lcss.clone());
+    sm.uncommitted = data.uncommitted.clone();
+    let mut peer_view = sm.lcss_next().unwrap().reverse();
+    peer_view.sign(peer_secret).unwrap();
+    controller
+        .handle_state_update(
+            peer_public,
+            StateUpdate {
+                block_day: peer_view.block_day,
+                local_updates: peer_view.local_updates,
+                remote_updates: peer_view.remote_updates,
+                local_sig_of_remote: peer_view.local_sig_of_remote,
+            },
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1389,6 +1413,144 @@ async fn test_hosted_to_hosted_fail_returns_to_source_peer() {
 }
 
 #[tokio::test]
+async fn test_hosted_origin_real_ln_ignores_host_fee_and_cltv_policy() {
+    let (controller, node, source_secret, source_public) = make_harness(false).await;
+    let secp = Secp256k1::new();
+    let (_, next_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &source_secret,
+        &source_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let payment_hash = [0x53u8; 32];
+    let real_scid = 5_061_345_003_001;
+    let amount_msat = 10_000_000;
+    let cltv_expiry = 700_100;
+    let source_htlc = UpdateAddHtlc {
+        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        id: 1,
+        amount_msat,
+        payment_hash,
+        cltv_expiry,
+        onion_routing_packet: Bytes::from(
+            canopusd::sphinx::create_relay_onion(
+                &controller.node_public,
+                &next_public,
+                real_scid,
+                amount_msat,
+                cltv_expiry,
+                &payment_hash,
+            )
+            .unwrap(),
+        ),
+        tlv_stream: Bytes::new(),
+    };
+
+    controller
+        .handle_update_add(&source_public, source_htlc)
+        .await
+        .unwrap();
+    commit_peer_updates(&controller, &source_public, &source_secret).await;
+
+    let onions = node.sent_onions.lock().unwrap();
+    assert_eq!(onions.len(), 1);
+    assert_eq!(onions[0].first_scid, real_scid);
+    assert_eq!(onions[0].first_amount_msat, amount_msat);
+}
+
+#[tokio::test]
+async fn test_hosted_to_hosted_still_enforces_host_policy() {
+    let (controller, node, source_secret, source_public) = make_harness(false).await;
+    let secp = Secp256k1::new();
+    let (target_secret, target_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &source_secret,
+        &source_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    establish_channel(&controller, &node, &target_secret, &target_public).await;
+    controller
+        .set_channel(
+            &target_public,
+            SetChannelParams {
+                fee_base_msat: Some(50_000),
+                fee_proportional_millionths: Some(0),
+                ..SetChannelParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    node.sent_messages.lock().unwrap().clear();
+
+    let payment_hash = [0x54u8; 32];
+    let target_scid = hosted_short_channel_id(&controller.node_public, &target_public);
+    let target_amount_msat = 10_000_000;
+    let source_amount_msat = 10_020_000;
+    let cltv_expiry = 700_100;
+    let source_htlc = UpdateAddHtlc {
+        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        id: 1,
+        amount_msat: source_amount_msat,
+        payment_hash,
+        cltv_expiry: 700_300,
+        onion_routing_packet: Bytes::from(
+            canopusd::sphinx::create_relay_onion(
+                &controller.node_public,
+                &target_public,
+                target_scid,
+                target_amount_msat,
+                cltv_expiry,
+                &payment_hash,
+            )
+            .unwrap(),
+        ),
+        tlv_stream: Bytes::new(),
+    };
+
+    controller
+        .handle_update_add(&source_public, source_htlc)
+        .await
+        .unwrap();
+    commit_peer_updates(&controller, &source_public, &source_secret).await;
+
+    let (sent_target_add, sent_source_fail) = {
+        let sent = node.sent_messages.lock().unwrap();
+        let sent_target_add = sent.iter().any(|(peer, bytes)| {
+            peer == &target_public
+                && matches!(
+                    HostedMessage::decode(bytes),
+                    Ok(HostedMessage::UpdateAddHtlc(_))
+                )
+        });
+        let sent_source_fail = sent.iter().any(|(peer, bytes)| {
+            peer == &source_public
+                && matches!(
+                    HostedMessage::decode(bytes),
+                    Ok(HostedMessage::UpdateFailHtlc(_))
+                )
+        });
+        (sent_target_add, sent_source_fail)
+    };
+
+    assert!(!sent_target_add);
+    assert!(sent_source_fail);
+}
+
+#[tokio::test]
 async fn test_resize_channel_acceptance() {
     let (controller, node, client_secret, client_public) = make_harness(false).await;
     establish_channel(&controller, &node, &client_secret, &client_public).await;
@@ -1448,6 +1610,211 @@ async fn test_runtime_policy_persists() {
     assert_eq!(loaded.htlc_minimum_msat, 5_000);
     assert_eq!(loaded.max_accepted_htlcs, 24);
     assert_eq!(loaded.cltv_expiry_delta, 144);
+}
+
+#[tokio::test]
+async fn test_channel_captures_routing_policy_at_creation() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    let mut policy = controller.effective_policy().await.unwrap();
+    policy.fee_base_msat = 2_222;
+    policy.fee_proportional_millionths = 444;
+    policy.cltv_expiry_delta = 99;
+    controller.set_policy(policy.clone()).await.unwrap();
+
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    let routing = data.routing_policy.unwrap();
+    assert_eq!(routing.fee_base_msat, 2_222);
+    assert_eq!(routing.fee_proportional_millionths, 444);
+    assert_eq!(routing.cltv_expiry_delta, 99);
+    assert_eq!(routing.htlc_maximum_msat, policy.channel_capacity_msat);
+
+    policy.fee_base_msat = 9_999;
+    controller.set_policy(policy).await.unwrap();
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.routing_policy.unwrap().fee_base_msat, 2_222);
+}
+
+#[tokio::test]
+async fn test_set_channel_reads_and_updates_routing_policy() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let (current, updated) = controller
+        .set_channel(&client_public, SetChannelParams::default())
+        .await
+        .unwrap();
+    assert!(!updated);
+    assert_eq!(current.feebase_msat, 1_000);
+    assert_eq!(current.feeppm, 1_000);
+
+    let (current, updated) = controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                fee_base_msat: Some(2_000),
+                fee_proportional_millionths: Some(500),
+                cltv_expiry_delta: Some(144),
+                htlc_maximum_msat: Some(50_000_000),
+                ..SetChannelParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(updated);
+    assert_eq!(current.feebase_msat, 2_000);
+    assert_eq!(current.feeppm, 500);
+    assert_eq!(current.cltv_expiry_delta, 144);
+    assert_eq!(current.htlc_maximum_msat, 50_000_000);
+
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!data.channel_update_pending);
+    let routing = data.routing_policy.unwrap();
+    assert_eq!(routing.fee_base_msat, 2_000);
+    assert_eq!(routing.htlc_maximum_msat, 50_000_000);
+
+    let phc = {
+        let sent = node.sent_messages.lock().unwrap();
+        sent.iter()
+            .rev()
+            .find_map(|(_, bytes)| match HostedMessage::decode(bytes) {
+                Ok(HostedMessage::PhcChannelUpdate(phc)) => Some(phc.body),
+                _ => None,
+            })
+    }
+    .expect("channel update");
+    assert_eq!(phc.fee_base_msat, 2_000);
+    assert_eq!(phc.fee_proportional_millionths, 500);
+    assert_eq!(phc.cltv_expiry_delta, 144);
+    assert_eq!(phc.htlc_maximum_msat, 50_000_000);
+}
+
+#[tokio::test]
+async fn test_set_channel_lcss_update_creates_pending_override() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let (current, updated) = controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                channel_capacity_msat: Some(120_000_000),
+                initial_client_balance_msat: Some(10_000_000),
+                htlc_minimum_msat: Some(1_000),
+                max_accepted_htlcs: Some(8),
+                ..SetChannelParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(updated);
+    assert!(current.override_pending);
+    assert_eq!(current.channel_capacity_msat, 120_000_000);
+    assert_eq!(current.remote_balance_msat, 10_000_000);
+    assert_eq!(current.local_balance_msat, 110_000_000);
+    assert_eq!(current.htlc_minimum_msat, 1_000);
+    assert_eq!(current.maxhtlcs, 8);
+
+    assert!(matches!(
+        last_sent_message(&node),
+        HostedMessage::StateOverride(_)
+    ));
+    let override_lcss = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap()
+        .proposed_override
+        .unwrap();
+    let mut accepted = override_lcss.reverse();
+    accepted.sign(&client_secret).unwrap();
+    controller
+        .handle_state_update(
+            &client_public,
+            StateUpdate {
+                block_day: override_lcss.block_day,
+                local_updates: accepted.local_updates,
+                remote_updates: accepted.remote_updates,
+                local_sig_of_remote: accepted.local_sig_of_remote,
+            },
+        )
+        .await
+        .unwrap();
+
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(data.proposed_override.is_none());
+    assert!(!data.channel_update_pending);
+    assert_eq!(
+        data.lcss.init_hosted_channel.channel_capacity_msat,
+        120_000_000
+    );
+    assert_eq!(data.lcss.remote_balance_msat, 10_000_000);
+}
+
+#[tokio::test]
+async fn test_set_channel_rejects_updates_with_pending_htlcs() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &client_secret,
+        &client_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    controller
+        .handle_update_add(
+            &client_public,
+            UpdateAddHtlc {
+                channel_id: canopusd::channel_id::channel_id(
+                    &controller.node_public,
+                    &client_public,
+                ),
+                id: 1,
+                amount_msat: 1_000_000,
+                payment_hash: [0x77; 32],
+                cltv_expiry: 700_100,
+                onion_routing_packet: Bytes::from(vec![0; 1366]),
+                tlv_stream: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                fee_base_msat: Some(2_000),
+                ..SetChannelParams::default()
+            },
+        )
+        .await
+        .is_err());
+    assert!(controller
+        .set_channel(&client_public, SetChannelParams::default())
+        .await
+        .is_ok());
 }
 
 #[tokio::test]

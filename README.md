@@ -166,18 +166,20 @@ lightning-cli canopusd-reset 028789... 80000000
 
 ### `canopusd-policy [fields...]`
 
-Get or update the default hosted-channel policy used for new channels and channel updates. Supported fields are `channel_capacity_msat`, `initial_client_balance_msat`, `max_htlc_value_in_flight_msat`, `htlc_minimum_msat`, `max_accepted_htlcs`, `fee_base_msat`, `fee_proportional_millionths`, and `cltv_expiry_delta`.
+Get or update the default hosted-channel policy used for new channels. Supported fields are `channel_capacity_msat`, `initial_client_balance_msat`, `max_htlc_value_in_flight_msat`, `htlc_minimum_msat`, `max_accepted_htlcs`, `fee_base_msat`, `fee_proportional_millionths`, and `cltv_expiry_delta`.
 
 ```bash
 lightning-cli canopusd-policy fee_base_msat=2000 fee_proportional_millionths=500 htlc_minimum_msat=1000 max_accepted_htlcs=24 cltv_expiry_delta=144
 ```
 
-### `canopusd-resize peerid capacity_sat`
+### `canopusd-setchannel peerid [fields...]`
 
-Allow a poncho-compatible hosted channel resize up to `capacity_sat`. Use `0` to cancel a pending resize authorization.
+Get or update per-channel hosted routing parameters. With only `peerid`, the command returns the current channel parameters. Optional fields update only when specified: `channel_capacity_msat`, `initial_client_balance_msat`, `feebase_msat`, `feeppm`, `cltv_expiry_delta`, `htlc_minimum_msat`, `htlc_maximum_msat`, and `maxhtlcs`.
+
+Updates are rejected while HTLCs are in flight. Changes to LCSS-backed fields such as channel capacity, client balance, HTLC minimum, or max HTLC count create a pending `state_override`; routing-only changes are persisted immediately and announced with a fresh channel update.
 
 ```bash
-lightning-cli canopusd-resize 028789... 150000
+lightning-cli canopusd-setchannel peerid=028789... feebase_msat=2000 feeppm=500 cltv_expiry_delta=144 htlc_maximum_msat=50000000
 ```
 
 ### `canopusd-events [peerid]`

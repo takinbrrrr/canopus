@@ -170,9 +170,9 @@ async fn main() -> anyhow::Result<()> {
                 .description("Propose a state_override for an errored hosted channel. If new_local_balance_msat is provided, the override uses that local balance; otherwise canopusd proposes a reset from current state."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-resize", handler::handle_resize)
-                .usage("peerid capacity_sat")
-                .description("Authorize a hosted-channel resize requested by peerid up to capacity_sat. Set capacity_sat to 0 to cancel a previously authorized resize."),
+            cln_plugin::RpcMethodBuilder::new("canopusd-setchannel", handler::handle_set_channel)
+                .usage("peerid [channel_capacity_msat] [initial_client_balance_msat] [feebase_msat] [feeppm] [cltv_expiry_delta] [htlc_minimum_msat] [htlc_maximum_msat] [maxhtlcs]")
+                .description("Show or update per-channel hosted routing parameters for peerid. Omitted fields keep their current values; updates are refused while HTLCs are in flight."),
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopusd-policy", handler::handle_policy)
@@ -347,6 +347,7 @@ fn compute_feature_bits_hex(bits: &[u64]) -> String {
 mod handler {
     use super::{build_runtime, PluginState, RuntimeState};
     use bytes::Bytes;
+    use canopusd::channel::SetChannelParams;
     use canopusd::channel_id::{
         format_short_channel_id, hosted_short_channel_id, parse_short_channel_id,
     };
@@ -611,8 +612,16 @@ mod handler {
 
     pub async fn handle_connect(
         plugin: Plugin<PluginState>,
-        _request: Value,
+        request: Value,
     ) -> Result<(), cln_plugin::Error> {
+        if let Some(peer) = param(&request, "id").and_then(|v| v.as_str()) {
+            if is_locked(&plugin).await {
+                return Ok(());
+            }
+            let peer = parse_peer(peer)?;
+            controller(&plugin).await?.handle_connect(&peer).await?;
+            return Ok(());
+        }
         if is_locked(&plugin).await {
             return Ok(());
         }
@@ -1173,7 +1182,7 @@ mod handler {
         Ok(json!({ "policy": policy, "updated": changed }))
     }
 
-    pub async fn handle_resize(
+    pub async fn handle_set_channel(
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
@@ -1181,19 +1190,47 @@ mod handler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing peerid"))?;
         let peer = parse_peer(peer)?;
-        let capacity_sat = arg(&request, 1, "capacity_sat")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("missing capacity_sat"))?;
-        let capacity = if capacity_sat == 0 {
-            None
-        } else {
-            Some(capacity_sat)
+        let params = SetChannelParams {
+            channel_capacity_msat: param(&request, "channel_capacity_msat")
+                .and_then(|v| v.as_u64()),
+            initial_client_balance_msat: param(&request, "initial_client_balance_msat")
+                .and_then(|v| v.as_u64()),
+            fee_base_msat: param(&request, "feebase_msat")
+                .or_else(|| param(&request, "fee_base_msat"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v.try_into())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("feebase_msat exceeds u32"))?,
+            fee_proportional_millionths: param(&request, "feeppm")
+                .or_else(|| param(&request, "fee_proportional_millionths"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v.try_into())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("feeppm exceeds u32"))?,
+            cltv_expiry_delta: param(&request, "cltv_expiry_delta")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.try_into())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("cltv_expiry_delta exceeds u16"))?,
+            htlc_minimum_msat: param(&request, "htlc_minimum_msat").and_then(|v| v.as_u64()),
+            htlc_maximum_msat: param(&request, "htlc_maximum_msat").and_then(|v| v.as_u64()),
+            max_accepted_htlcs: param(&request, "maxhtlcs")
+                .or_else(|| param(&request, "max_accepted_htlcs"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v.try_into())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("maxhtlcs exceeds u16"))?,
         };
-        controller(&plugin)
-            .await?
-            .accept_resize(&peer, capacity)
-            .await?;
-        Ok(json!({ "ok": true }))
+        let controller = controller(&plugin).await?;
+        let short_channel_id =
+            format_short_channel_id(hosted_short_channel_id(&controller.node_public, &peer));
+        let (channel, updated) = controller.set_channel(&peer, params).await?;
+        Ok(json!({
+            "peer_id": peer.to_string(),
+            "short_channel_id": short_channel_id,
+            "channel": channel,
+            "updated": updated,
+        }))
     }
 
     pub async fn handle_status(

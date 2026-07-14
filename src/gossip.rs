@@ -12,12 +12,14 @@ use crate::wire::{ChannelUpdate, PhcChannelUpdate, TAG_PHC_CHANNEL_UPDATE_SYNC};
 ///
 /// The signature covers the double-SHA256 of the witness (everything after
 /// the signature field, including the TLV stream).
+#[allow(clippy::too_many_arguments)]
 pub fn build_channel_update(
     node_secret: &SecretKey,
     node_public: &PublicKey,
     peer_id: &PublicKey,
     chain_hash: [u8; 32],
     policy: &ChannelPolicy,
+    htlc_maximum_msat: u64,
     enabled: bool,
     timestamp: u32,
 ) -> ChannelUpdate {
@@ -35,7 +37,7 @@ pub fn build_channel_update(
         htlc_minimum_msat: policy.htlc_minimum_msat,
         fee_base_msat: policy.fee_base_msat,
         fee_proportional_millionths: policy.fee_proportional_millionths,
-        htlc_maximum_msat: policy.channel_capacity_msat,
+        htlc_maximum_msat,
         tlv_stream: Bytes::new(),
     };
 
@@ -56,12 +58,14 @@ pub fn build_channel_update(
 }
 
 /// Build a standard BOLT-7 `channel_update` message (type tag `258` + body).
+#[allow(clippy::too_many_arguments)]
 pub fn channel_update(
     node_secret: &SecretKey,
     node_public: &PublicKey,
     peer_id: &PublicKey,
     chain_hash: [u8; 32],
     policy: &ChannelPolicy,
+    htlc_maximum_msat: u64,
     enabled: bool,
     timestamp: u32,
 ) -> Bytes {
@@ -71,6 +75,7 @@ pub fn channel_update(
         peer_id,
         chain_hash,
         policy,
+        htlc_maximum_msat,
         enabled,
         timestamp,
     );
@@ -85,12 +90,14 @@ pub fn channel_update(
 /// cliche/immortan uses `PHC_UPDATE_SYNC_TAG` (64507) for outbound hosted
 /// channel updates sent directly to the peer.  The body is identical to the
 /// standard BOLT-7 `channel_update` body (without the `258` type prefix).
+#[allow(clippy::too_many_arguments)]
 pub fn phc_channel_update_sync(
     node_secret: &SecretKey,
     node_public: &PublicKey,
     peer_id: &PublicKey,
     chain_hash: [u8; 32],
     policy: &ChannelPolicy,
+    htlc_maximum_msat: u64,
     enabled: bool,
     timestamp: u32,
 ) -> PhcChannelUpdate {
@@ -100,6 +107,7 @@ pub fn phc_channel_update_sync(
         peer_id,
         chain_hash,
         policy,
+        htlc_maximum_msat,
         enabled,
         timestamp,
     );
@@ -125,7 +133,16 @@ mod tests {
         let (sk, pk) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let (_, peer) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let policy = ChannelPolicy::default();
-        let bytes = channel_update(&sk, &pk, &peer, [1; 32], &policy, true, 1_700_000_000);
+        let bytes = channel_update(
+            &sk,
+            &pk,
+            &peer,
+            [1; 32],
+            &policy,
+            policy.channel_capacity_msat,
+            true,
+            1_700_000_000,
+        );
         assert_eq!(bytes.len(), 138);
         assert_eq!(&bytes[..2], &[0x01, 0x02]);
     }
@@ -136,7 +153,16 @@ mod tests {
         let (sk, pk) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let (_, peer) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let policy = ChannelPolicy::default();
-        let phc = phc_channel_update_sync(&sk, &pk, &peer, [1; 32], &policy, true, 1_700_000_000);
+        let phc = phc_channel_update_sync(
+            &sk,
+            &pk,
+            &peer,
+            [1; 32],
+            &policy,
+            policy.channel_capacity_msat,
+            true,
+            1_700_000_000,
+        );
         assert_eq!(phc.tag, 64507);
         let encoded = crate::wire::HostedMessage::PhcChannelUpdate(phc)
             .encode()
@@ -150,8 +176,26 @@ mod tests {
         let (sk, pk) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let (_, peer) = secp.generate_keypair(&mut rand::rngs::OsRng);
         let policy = ChannelPolicy::default();
-        let bolt = channel_update(&sk, &pk, &peer, [1; 32], &policy, true, 42);
-        let phc = phc_channel_update_sync(&sk, &pk, &peer, [1; 32], &policy, true, 42);
+        let bolt = channel_update(
+            &sk,
+            &pk,
+            &peer,
+            [1; 32],
+            &policy,
+            policy.channel_capacity_msat,
+            true,
+            42,
+        );
+        let phc = phc_channel_update_sync(
+            &sk,
+            &pk,
+            &peer,
+            [1; 32],
+            &policy,
+            policy.channel_capacity_msat,
+            true,
+            42,
+        );
         let mut phc_encoded = BytesMut::new();
         phc.body.encode(&mut phc_encoded).unwrap();
         assert_eq!(&bolt[2..], &phc_encoded[..]);

@@ -2,121 +2,547 @@
 
 Guide for AI agents working on the `canopusd` codebase.
 
+This file is intended to carry hard-won project context forward between sessions. Keep it accurate when behavior changes. The most important rule is to preserve protocol compatibility and funds-safety invariants before making code look cleaner.
+
 ## What This Project Is
 
-`canopusd` is a Rust plugin for Core Lightning (CLN) that implements the **HOST** side of [bLIP-17 Hosted Channels](https://github.com/lightning/blips/blob/master/blip-0017.md). It is wire-compatible with clients like [cliche](https://github.com/nbd-wtf/cliche) and the Scala-based reference host [poncho](https://github.com/nbd-wtf/poncho).
+`canopusd` is a Rust plugin for Core Lightning (CLN) that implements the HOST side of bLIP-17 Hosted Channels. It is designed to interoperate with cliche, immortan, and the Scala reference host poncho.
 
-Hosted channels are custodial Lightning channels where the client trusts the host. The host signs channel state with its node key; the client verifies against the node's public key. There is no on-chain funding transaction — state is tracked entirely off-chain via signed `last_cross_signed_state` (LCSS) messages.
+Hosted channels are custodial Lightning-like channels. There is no on-chain funding transaction. The client trusts the host for custody, but both sides maintain an auditable off-chain state called `last_cross_signed_state` (LCSS). The host signs channel state with the CLN node key, and the client verifies against the host node pubkey.
 
-## Build & Test Commands
+`canopusd` is not a generic Lightning node implementation. It is a CLN plugin that bridges hosted-channel peers to CLN functionality: custom messages, datastore, `htlc_accepted`, `sendonion`, `sendpay_success`/`sendpay_failure`, raw blocks, and plugin RPC methods.
+
+## Build And Test Commands
+
+Run these from `/workspace/canopusd`.
 
 ```bash
-cargo build                              # debug build
-cargo build --release                    # release binary at target/release/canopusd
-cargo test                               # all 133 tests (113 lib + 2 main + 18 integration)
-cargo test --test integration            # integration tests only
-cargo clippy --all-targets -- -D warnings  # lint (must be zero warnings)
-cargo audit                              # vulnerability scan
+cargo build
+cargo build --release
+cargo test
+cargo test --test integration
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo audit
 ```
 
-No `lightningd`, `bitcoind`, or JVM is available in the sandbox. All tests are mock-based (in-memory store + mock node). Real-world interop testing requires a regtest environment — see the README manual testing guide.
+Current expected test shape after the latest work is approximately:
 
-## Code Conventions
+- 127 library unit tests
+- 6 binary unit tests
+- 35 integration tests
 
-- **No comments in code** unless explicitly requested. Comments exist only in module-level doc-comments (`//!`) and on non-obvious protocol-specific logic (sighash field order, reversal semantics, etc.).
-- **Clippy is law**: `cargo clippy --all-targets -- -D warnings` must pass with zero warnings before any commit.
-- **Checked arithmetic**: all millisatoshi (`u64`) operations use `checked_add`/`checked_sub` — never bare `+`/`-` on amounts. Overflow returns an error.
-- **Persist before side effects**: channel state is written to the datastore (with generation CAS) *before* sending any messages or resolving HTLCs. This is the most critical safety invariant.
-- **Tests use `Arc<MockNode>`**: the `MockNode` records all sent messages, sent onions, HTLC resolutions, and notifications for later inspection. When asserting on `MockNode` fields, scope the `MutexGuard` in a block to avoid holding it across `.await` points (clippy catches this, but be aware).
-- **`Bytes` from the `bytes` crate**: used for all binary data. It doesn't implement `PartialEq<[u8; N]>`, so use `.as_ref()` for comparisons in tests.
-- **Serde for `[u8; N]` arrays**: arrays like `[u8; 32]` and `[u8; 64]` don't auto-derive `Serialize`/`Deserialize`. Use the custom `serde_bytes_hex` (in `wire/codecs.rs`) for `Bytes` fields and `serde_array_hex_32`/`serde_array_hex_64` (in `wire/lcss.rs` and `store.rs`) for fixed arrays.
+The exact count may change, but all tests and clippy must pass before handing off code changes. The sandbox does not provide `lightningd`, `bitcoind`, or a JVM. All normal tests are mock-based with `MemoryStore` and `MockNode`. Live cliche/immortan/poncho/CLN interop requires an external regtest environment.
 
-## Architecture
+## General Engineering Rules
 
-```
+- Clippy is law: `cargo clippy --all-targets -- -D warnings` must pass with zero warnings.
+- Formatting is required: run `cargo fmt` or at least `cargo fmt --check` before finalizing.
+- Use checked arithmetic for millisatoshi values. Avoid bare `+`/`-` on balances, capacities, fees, and HTLC amounts. Use `checked_add`, `checked_sub`, or saturating arithmetic only when the protocol behavior explicitly wants saturation.
+- Persist state before side effects. Channel state must be written to the datastore before sending messages, resolving CLN HTLC hooks, or depending on payment outcomes.
+- Prefer minimal changes. Do not introduce new abstractions unless they reduce real duplication or make a protocol rule safer.
+- Do not add backward-compatibility code unless there is persisted data, shipped behavior, or external interoperability at stake. In this repo, persisted CLN datastore JSON is a real compatibility concern.
+- Avoid code comments unless the protocol detail is non-obvious. Module docs and short comments around sighash/reversal/wire-compat details are acceptable.
+- Never hold a `MutexGuard` across `.await` in tests. Scope `node.sent_messages.lock().unwrap()` and similar guards tightly.
+- `Bytes` from the `bytes` crate is used for binary payloads. Compare with `.as_ref()` when needed.
+- Serde does not directly handle fixed `[u8; N]` arrays the way this project needs. Use existing serde helpers such as `serde_bytes_hex`, `serde_array_hex_32`, and `serde_array_hex_64`.
+
+## Architecture Map
+
+```text
 src/
-  lib.rs          Library root (re-exports all modules for integration tests)
-  main.rs         Binary entry: cln-plugin Builder, options, hooks, RPC methods, PluginState
-  config.rs       Config, ChannelPolicy, Branding, ChannelSecret (one-time, constant-time compare)
-  keys.rs         NodeKeys: reads hsm_secret, HKDF-SHA256(salt=0x00, info="nodeid") → node keypair
-  channel_id.rs   Deterministic channel_id (SHA256 of sorted pubkey concat) and fake scid
-  state.rs        StateManager: pure-functional fold of uncommitted updates → next LCSS
-  store.rs        Store trait (object-safe) + MemoryStore + free functions (get_json, cas_json, etc.)
-  cln_node.rs     CLN RPC-backed NodeActions implementation
-  cln_store.rs    CLN datastore-backed Store implementation
-  gossip.rs       Signed BOLT-7 channel_update construction for hosted fake scids
-  node.rs         NodeActions trait (send_custom_msg, send_onion, resolve_htlc, raw blocks, etc.) + MockNode
-  channel.rs      ChannelController: the main state machine (establishment, reconnect, HTLC, errors, override)
+  lib.rs          Library root; re-exports modules for integration tests.
+  main.rs         CLN plugin bootstrap: options, hooks, RPCs, subscriptions, runtime lock/unlock.
+  config.rs       Config, ChannelPolicy, Branding, one-time ChannelSecret.
+  keys.rs         Reads hsm_secret and derives the CLN node key with HKDF-SHA256.
+  channel_id.rs   Deterministic hosted channel_id and fake short_channel_id helpers.
+  state.rs        Pure StateManager fold from LCSS + uncommitted updates to next LCSS.
+  store.rs        Store trait, MemoryStore, CAS JSON helpers, persisted data structs.
+  cln_store.rs    CLN datastore-backed Store implementation.
+  cln_node.rs     CLN RPC-backed NodeActions implementation.
+  node.rs         NodeActions trait, MockNode, payment statuses, HTLC resolutions.
+  gossip.rs       Signed BOLT-7/PHC channel_update construction for fake hosted scids.
+  channel.rs      ChannelController: establishment, reconnect, HTLCs, policy, override, errors.
+  htlc.rs         htlc_accepted manager and sendpay result manager.
+  sphinx.rs       BOLT-4 onion peel/create/failure wrap helpers.
+  ledger.rs       Append-only accounting ledger and custom notifications.
+  scanner.rs      OP_RETURN preimage scanner.
   wire/
-    mod.rs        HostedMessage enum, tag dispatch, all message structs
-    codecs.rs     Primitive read/write (BE for wire, LE for sighash), UpdateAddHtlc, serde helpers
-    lcss.rs       LastCrossSignedState: encode/decode, reverse(), hosted_sig_hash(), sign/verify
-  sphinx.rs       BOLT-4 Sphinx: peel_onion, wrap_failure, TLV parsing, ECDH, ChaCha20, blinding
-  htlc.rs         HtlcManager: htlc_accepted hook → channel dispatch, sendpay result → upstream resolve
-  ledger.rs       LedgerManager: append-only event log in datastore + custom notifications
-  scanner.rs      PreimageScanner: raw block OP_RETURN preimage scanning
+    mod.rs        HostedMessage enum, tag dispatch, message structs, PHC ChannelUpdate.
+    codecs.rs     Primitive codecs, BOLT-2 update_add_htlc codec, TLV validation.
+    lcss.rs       InitHostedChannel and LastCrossSignedState encode/sign/reverse/verify.
 tests/
-  integration.rs  18 tests covering full channel lifecycle with mock node + memory store
+  integration.rs  Full lifecycle tests with MemoryStore and MockNode.
 ```
 
-## Key Design Decisions (confirmed with user)
+## CLN Plugin Surface
 
-1. **Node key access**: reads `hsm_secret` directly and derives the node key via HKDF. Plain, mnemonic, and passphrase-protected CLN secret formats are supported. Passphrase-protected secrets start the plugin locked; unlock with `canopusd-unlock passphrase_file=...` or the less secure direct `passphrase=...`. No CLN RPC can produce the needed signatures. The key/passphrase buffers are zeroized where practical.
-2. **Secrets**: one-time 32-byte values, provisioned as 64-character hex strings, persisted in datastore by raw-byte hex key, consumed atomically via generation CAS. Per-secret capacity and initial balance.
-3. **Accounting**: own append-only ledger in the datastore (not CLN's bookkeeper, which can't ingest plugin HTLCs). Emits custom notifications (`canopusd_htlc_settled`, etc.) for other plugins.
-4. **Datastore generation CAS**: all writes use read(generation) → modify → update(must-replace, generation). The `cas_json` free function retries on `GenerationMismatch` up to 10 times.
-5. **Feature bits**: init = {257}, node = {257}. Legacy hosted-channel feature bit 32973 is intentionally not advertised. Do not call `Builder::dynamic()`; CLN requires `dynamic: false` for plugins that advertise custom feature bits, and `cln-plugin` defaults to non-dynamic.
-6. **Preimage scanner**: raw blocks are fetched through `NodeActions::get_raw_block_by_height`, deserialized with the `bitcoin` crate, and scanned for `OP_RETURN <32-byte-preimage>` pushes matching watched payment hashes.
-7. **Direct `pay` interception**: the `rpc_command` hook parses BOLT11 invoices, detects single-hop hosted route hints, sends direct hosted HTLCs, and returns a CLN-compatible pay result when the hosted peer fulfills. It still needs live cliche/CLN validation.
+`main.rs` registers:
 
-## Sighash Algorithm (critical for interop)
+- `custommsg` hook for bLIP-17 hosted-channel messages.
+- `htlc_accepted` hook for forwarding real CLN incoming HTLCs into hosted channels.
+- `rpc_command` hook for direct hosted `pay` interception.
+- `sendpay_success` and `sendpay_failure` subscriptions for downstream real-LN payment results.
+- `connect` and `disconnect` subscriptions.
+- RPC methods documented below.
 
-The `hosted_sig_hash` in `wire/lcss.rs` must match the scoin reference (`HostedChannelMessages.scala`) exactly. The signed material is the concatenation of:
+The plugin advertises custom feature bit 257 in init and node announcements. Do not call `Builder::dynamic()`; CLN requires non-dynamic plugins for custom feature bits, and `cln-plugin` defaults to non-dynamic.
 
-1. `refund_scriptpubkey` (raw bytes, no length prefix)
-2. `channel_capacity_msat` (u64 **little-endian**)
-3. `initial_client_balance_msat` (u64 LE)
-4. `block_day` (u32 LE)
-5. `local_balance_msat` (u64 LE)
-6. `remote_balance_msat` (u64 LE)
-7. `local_updates` (u32 LE)
-8. `remote_updates` (u32 LE)
-9. concat of each incoming HTLC encoded as BOLT-2 `update_add_htlc` body (**big-endian** wire encoding)
-10. concat of each outgoing HTLC (same encoding)
-11. 1 byte `hostFlag` (1 if `is_host`, else 0)
+The plugin can start locked if the CLN `hsm_secret` requires a passphrase. While locked, hooks remain safe/no-op/continue. Unlock with `canopusd-unlock passphrase_file=...` or direct `passphrase=...`.
 
-Then `SHA256(material)`. Signatures are compact 64-byte ECDSA (non-recoverable). You sign the **reverse** of your view (the peer's view). Verify checks the peer's signature over **your** view.
+## RPC Argument Parsing
 
-## What's Complete
+All canopusd RPC handlers either take no args or support named arguments.
 
-- Wire codecs for all bLIP-17 message types plus poncho-compatible `resize_channel`, preimage query/reply, `announcement_signature` (65523), `query_public_hosted_channels` (65519), `reply_public_hosted_channels_end` (65517), and typed PHC `ChannelUpdate` (64509/64507) — all with strict scoin-compatible encoding (tested)
-- All encoding is fallible (`EncodeResult`); `uint64overflow` bounds enforced everywhere (reject >= 2^63); `read_varint` 0xff threshold fixed to `0x1_0000_0000`; `write_varsize` checks u16::MAX; onion packet length enforced at 1366 bytes on encode; strict canonical TLV validation (monotonic tags, no duplicates, even tags < 2^32 rejected); inbound framing auto-detects strict `tag || body` and legacy cliche/immortan `tag || len || body`, and outbound framing follows the detected per-session encoding; `HostedChannelBranding.contact_info` validated as UTF-8
-- LCSS with `reverse()`, `hosted_sig_hash()` (returns `EncodeResult`), `sign()` (returns `EncodeResult`), `verify_remote_sig()` (returns `false` on encode error), `state_update()`, `state_override()` (cross-sign consistency tested)
-- Node key derivation from hsm_secret (HKDF-SHA256, legacy plain, mnemonic passphrase/no-passphrase tested; legacy encrypted needs live CLN fixture validation)
-- Datastore with generation CAS + retry + `Arc<T>` blanket impl (tested)
-- StateManager: folds add/fulfill/fail/fail_malformed updates, checked arithmetic, preimage verification (tested)
-- ChannelController: establishment, reconnect LCSS reconciliation, normal operation, sendpay result handling, hosted-to-hosted forwarding, errors, `state_override` reset, poncho-compatible resize authorization, runtime policy persistence, preimage query/reply, secrets (add/consume/remove/list), branding, list channels, HTLC add from hook, chain-hash mismatch logging (tested)
-- Sphinx onion: peel, failure wrap, ECDH, blinding, TLV parsing, varint (unit tested)
-- HtlcManager: htlc_accepted dispatch, persisted forward links with payment hash/shared secret, payment result resolution, startup grace period
-- LedgerManager: record events, list by peer, balance computation (tested)
-- PreimageScanner: raw block deserialization and OP_RETURN preimage matching (tested)
-- ClnStore and ClnNode: production CLN RPC/datastore adapters compile and are exercised through abstractions in mock tests; live CLN validation still required
-- Plugin bootstrap: 14 CLN options, feature bits, hooks (custommsg, htlc_accepted, rpc_command), sendpay subscriptions, RPC methods, connect/disconnect subscriptions
-- Integration tests: 18 tests covering full lifecycle
+The helper behavior in `main.rs` is:
 
-## What's Incomplete / Production Validation
+- `param(request, key)` checks a top-level key and `params.key`.
+- `arg(request, index, key)` checks the named key first, then a positional array fallback.
 
-No `TODO` or `stub` markers are expected in `src/`. Current known gaps are external validation or deliberately scoped features:
+Examples:
 
-1. **Live CLN/regtest validation**: `ClnStore`, `ClnNode`, production handler wiring, hook request/response JSON shapes, notifications, and datastore generation behavior compile but still need testing against real `lightningd`/`bitcoind`.
-2. **Full direct hosted `pay` interception**: `rpc_command` is registered and returns `continue` for `pay`. Full poncho-style direct hosted payments require BOLT11 parsing, route-hint matching, final-hop onion creation, and direct hosted HTLC result handling.
-3. **Interop hardening**: run against `cliche` and/or poncho-compatible clients to validate strict/legacy framing auto-detection, resize semantics, channel updates, failure wrapping, and HTLC replay behavior on restart.
-4. **Hosted-to-hosted forwarding edge cases**: persisted `ForwardLink`s include payment hash and optional shared secret, and mock tests cover basic resolution/failure wrapping. More restart and multi-channel tests should be added when live interop is available.
+```bash
+lightning-cli canopusd-channel peerid=02...
+lightning-cli canopusd-channel 02...
+lightning-cli canopusd-setchannel peerid=02... feebase_msat=2000 feeppm=500
+```
+
+Registered RPC methods:
+
+- `canopusd-status`: no args. Shows locked/unlocked runtime state.
+- `canopusd-unlock`: supports `passphrase=...` or `passphrase_file=...` and requires exactly one.
+- `canopusd-list`: no args. Lists known hosted channels and derived status.
+- `canopusd-channel`: supports `peerid=...`; returns full persisted channel data.
+- `canopusd-removehc`: supports `peerid=...` and `force=...`; refuses removal with in-flight/pending HTLCs unless forced.
+- `canopusd-addsecret`: supports `secret=...`, `capacity_msat=...`, `initial_balance_msat=...`.
+- `canopusd-removesecret`: supports `secret=...`.
+- `canopusd-listsecrets`: no args.
+- `canopusd-reset`: supports `peerid=...`, optional `new_local_balance_msat=...`; recovery command for errored/overriding channels.
+- `canopusd-policy`: supports named policy fields; updates global defaults used for new channels.
+- `canopusd-setchannel`: supports `peerid=...` plus optional per-channel fields; see the channel policy section.
+- `canopusd-events`: supports optional `peerid=...`.
+
+The public `canopusd-resize` RPC was replaced by `canopusd-setchannel`. The wire-level poncho `resize_channel` custom message still exists and is handled internally for client-driven resize compatibility.
+
+## Persisted Data Model
+
+All production persistence goes through CLN datastore via `ClnStore`; tests use `MemoryStore`. Data is JSON encoded under the `canopusd` namespace.
+
+Important keys:
+
+- `canopusd/channels/<peer_pubkey_hex>` -> `ChannelData`
+- `canopusd/policy` -> global `ChannelPolicy`
+- `canopusd/secrets/<secret_hex>` -> one-time `ChannelSecret`
+- `canopusd/htlc_forwards/<scid>/<htlc_id>` -> `ForwardLink`
+- `canopusd/preimages/<payment_hash_hex>` -> preimage hex
+- `canopusd/ledger/<seq>` -> ledger event
+- `canopusd/meta` -> ledger sequence metadata
+
+`ChannelData` contains:
+
+- `lcss`: the committed cross-signed hosted state.
+- `uncommitted`: local/remote updates not yet folded into committed LCSS.
+- `local_errors` and `remote_errors`: error state markers.
+- `suspended`: administrative suspended flag.
+- `proposed_override`: pending LCSS override awaiting peer acceptance.
+- `last_refund_scriptpubkey`: last refund script received from client.
+- `established`: whether the opening exchange completed.
+- `accepting_resize_sat`: legacy/poncho wire resize authorization.
+- `routing_policy`: optional per-channel routing policy not covered by LCSS.
+- `channel_update_pending`: durable flag indicating a PHC channel_update should be sent when possible.
+
+`routing_policy` is optional for migration. Old stored channels will load with `None`; code derives a fallback from current global `effective_policy()` when needed. New channels store `Some(ChannelRoutingPolicy::from_policy(effective_policy))` at creation.
+
+## Global Policy Versus Per-Channel Policy
+
+There are two policy concepts now. Do not conflate them.
+
+Global policy:
+
+- Type: `ChannelPolicy` in `config.rs`.
+- Stored at `canopusd/policy` when changed by `canopusd-policy`.
+- Loaded by `effective_policy()`; falls back to startup config/defaults if not persisted.
+- Used for new channel creation and secret-derived effective policy.
+- Updating it does not mutate existing channels.
+
+Per-channel state and routing policy:
+
+- LCSS-backed fields live inside `LastCrossSignedState.init_hosted_channel` and are signed:
+  - `channel_capacity_msat`
+  - `initial_client_balance_msat`
+  - `max_htlc_value_in_flight_msat`
+  - `htlc_minimum_msat`
+  - `max_accepted_htlcs`
+- Non-LCSS routing fields live in `ChannelData.routing_policy`:
+  - `fee_base_msat`
+  - `fee_proportional_millionths`
+  - `cltv_expiry_delta`
+  - `htlc_maximum_msat`
+
+`htlc_minimum_msat` is an LCSS field because it is part of `InitHostedChannel`, which is embedded in the signed LCSS. Changing it for an existing channel requires a state-override-style flow.
+
+`htlc_maximum_msat` is a BOLT channel_update routing field, not an LCSS field. Historically it was derived from channel capacity; it is now stored per channel in `ChannelRoutingPolicy`.
+
+## `canopusd-setchannel` Semantics
+
+`canopusd-setchannel peerid` with no optional fields is read-only and returns the current channel parameters. It is allowed even if HTLCs are in flight.
+
+Optional fields update only when specified:
+
+- `channel_capacity_msat`
+- `initial_client_balance_msat`
+- `feebase_msat` (alias accepted: `fee_base_msat`)
+- `feeppm` (alias accepted: `fee_proportional_millionths`)
+- `cltv_expiry_delta`
+- `htlc_minimum_msat`
+- `htlc_maximum_msat`
+- `maxhtlcs` (alias accepted: `max_accepted_htlcs`)
+
+Any update is rejected if the channel has committed in-flight HTLCs or uncommitted updates. Specifically, updates are refused when `incoming_htlcs`, `outgoing_htlcs`, or `uncommitted` is non-empty.
+
+Routing-only updates:
+
+- Update `ChannelData.routing_policy` directly.
+- Set `channel_update_pending = true`.
+- Try to send PHC channel_update immediately.
+- Clear `channel_update_pending` only after successful send.
+
+LCSS-affecting updates:
+
+- Affect `channel_capacity_msat`, `initial_client_balance_msat`, `htlc_minimum_msat`, or `maxhtlcs`.
+- Build a new proposed LCSS with updated `init_hosted_channel` and balances.
+- Persist `proposed_override = Some(override_lcss)` and `channel_update_pending = true`.
+- Send `state_override` immediately if possible.
+- If the peer is offline, the existing reconnect/override path resends `state_override` on next hosted-channel invoke/reconnect.
+- After peer accepts the override with `state_update`, the controller persists the new LCSS, clears `proposed_override`, sends or flushes the pending channel_update, and clears `channel_update_pending` after successful send.
+
+Balance semantics for setchannel and reset:
+
+- In host-side LCSS, `local_balance_msat` is host balance and `remote_balance_msat` is client balance.
+- When setting `initial_client_balance_msat` through setchannel, the proposed override uses it as the new client/remote balance.
+- Host/local balance becomes `channel_capacity_msat - remote_balance_msat`.
+- `canopusd-reset peerid new_local_balance_msat` is different: it takes host/local balance and computes client/remote balance as `capacity - new_local_balance_msat`.
+
+Keep `canopusd-reset` as a separate emergency recovery command. It only works in `Errored` or `Overriding` status and clears HTLCs as part of reset. `canopusd-setchannel` is an administrative configuration command for healthy active channels and rejects in-flight HTLCs.
+
+## Channel Updates
+
+Hosted channel updates are PHC-wrapped BOLT-7 `channel_update` bodies sent as `HostedMessage::PhcChannelUpdate` with tag `64507` (`TAG_PHC_CHANNEL_UPDATE_SYNC`). cliche/immortan expect this PHC sync tag for direct peer updates, not standard tag `258`.
+
+`send_channel_update(peerid)` builds the advertised policy from:
+
+- LCSS/init fields for capacity, max in-flight, HTLC minimum, and max accepted HTLC count.
+- `ChannelData.routing_policy` for fee base, fee ppm, CLTV delta, and HTLC maximum.
+
+Channel updates are currently sent:
+
+- after initial channel establishment completes;
+- after accepted `state_override`;
+- after wire-level hosted `resize_channel` acceptance;
+- after successful routing-only `canopusd-setchannel` updates;
+- after accepted setchannel-created override;
+- on active hosted reconnect or CLN connect when `channel_update_pending` is true.
+
+If sending a channel_update fails, leave `channel_update_pending = true`. Do not clear it before a successful send.
+
+## LCSS And Sighash Rules
+
+`LastCrossSignedState` is the core signed object. The `hosted_sig_hash` in `wire/lcss.rs` must match the scoin reference exactly.
+
+Signed material order:
+
+1. `refund_scriptpubkey` raw bytes, no length prefix.
+2. `channel_capacity_msat` as u64 little-endian.
+3. `initial_client_balance_msat` as u64 little-endian.
+4. `block_day` as u32 little-endian.
+5. `local_balance_msat` as u64 little-endian.
+6. `remote_balance_msat` as u64 little-endian.
+7. `local_updates` as u32 little-endian.
+8. `remote_updates` as u32 little-endian.
+9. Concatenated incoming HTLCs encoded as BOLT-2 `update_add_htlc` bodies, using big-endian wire encoding.
+10. Concatenated outgoing HTLCs encoded the same way.
+11. One byte `hostFlag`: `1` if `is_host`, otherwise `0`.
+
+Then `SHA256(material)` is signed with compact 64-byte ECDSA.
+
+Important direction rules:
+
+- `reverse()` swaps local/remote fields and incoming/outgoing HTLCs.
+- You sign the peer's view, which is usually `your_view.reverse()`.
+- You verify the peer signature over your view.
+- Do not casually change `reverse()`, sighash ordering, endian choices, or HTLC body encoding. These are interop-critical.
+
+Status derivation:
+
+- `Suspended` if `suspended`.
+- `Overriding` if `proposed_override.is_some()`.
+- `Errored` if local or remote errors exist.
+- `Opening` before establishment.
+- `Active` otherwise.
+
+## Reconnect And Replay Behavior
+
+Active reconnect sends the stored LCSS, replays uncommitted local updates exactly as persisted, and sends a matching `state_update` if uncommitted updates exist.
+
+Errored/overriding reconnect sends the stored LCSS, sends a local error if present, and resends `state_override` if `proposed_override` exists.
+
+Pending channel updates are durable via `channel_update_pending`. Active reconnect and CLN connect attempt to flush them. This is required so routing-only `canopusd-setchannel` changes made while a client is offline are delivered on next connection.
+
+The disconnect handler clears legacy session wire encoding. It otherwise relies on persisted state and reconnect reconciliation.
+
+## Wire Compatibility And Framing
+
+Wire codecs are intentionally strict, but inbound custom message framing auto-detects:
+
+- strict `tag || body`
+- legacy cliche/immortan `tag || len || body`
+
+Outbound framing follows the per-session encoding detected for that peer. Do not remove this unless all target clients are proven to have moved to strict framing.
+
+Encoding notes:
+
+- `uint64overflow` values reject values >= 2^63.
+- Onion packets must be exactly 1366 bytes when encoded as `update_add_htlc`.
+- TLV streams must be canonical: monotonic types, no duplicates, unknown even types below the high range rejected.
+- `HostedChannelBranding.contact_info` must be valid UTF-8.
+- The repo carries poncho-compatible extension messages such as `resize_channel`, `announcement_signature`, preimage query/reply, public hosted channel query/reply, and PHC channel updates.
+
+## HTLC State Machine
+
+StateManager is pure and folds `lcss + uncommitted` to produce the next LCSS. It does not send messages or persist. ChannelController owns persistence and side effects.
+
+Direction from host perspective:
+
+- Local add: host adds an outgoing HTLC to the client/hosted channel. Host local balance decreases and `outgoing_htlcs` grows.
+- Remote add: client adds an incoming HTLC to the host. Client/remote balance decreases and `incoming_htlcs` grows.
+- Local fulfill/fail resolves incoming HTLCs.
+- Remote fulfill/fail resolves outgoing HTLCs.
+
+All peer-originated add/fail/fulfill/fail_malformed updates are persisted as uncommitted first. Side effects for newly committed hosted-origin incoming HTLCs happen only after the peer commits them with a valid state update.
+
+Known preimages are checked for idempotency. Preimages are persisted before relaying fulfills upstream.
+
+## Hosted-Origin Routing Behavior
+
+Hosted-origin means the client sends an `update_add_htlc` into canopusd, and after commit canopusd peels the onion and forwards either to another hosted channel or to real Lightning via CLN `sendonion`.
+
+Basic checks always apply before forwarding:
+
+- The incoming hosted HTLC must satisfy the source channel's LCSS limits: HTLC minimum, max accepted HTLCs, max in-flight.
+- The onion must peel successfully with BOLT-4 rules using the HTLC `payment_hash` as associated data.
+- The incoming amount must be at least the peeled `amt_to_forward`.
+
+For hosted-origin to real-LN forwarding:
+
+- Do not enforce host fee base, fee ppm, or host CLTV spread.
+- CLN validates the real outgoing channel constraints when `sendonion` is called.
+- canopusd still persists a `ForwardLink` before calling `sendonion`.
+- The `sendonion` label is `<outgoing_scid>/<outgoing_htlc_id>`.
+- `group_id` is `outgoing_scid / 100`; `part_id` is the outgoing HTLC id.
+
+For hosted-origin to hosted-destination forwarding:
+
+- Resolve the destination hosted peer by fake hosted short_channel_id.
+- Use the destination channel's stored per-channel routing policy for fee and CLTV checks.
+- Required fee is based on destination `fee_base_msat` and `fee_proportional_millionths`.
+- CLTV spread uses destination `cltv_expiry_delta`.
+- Destination `channel_handle_htlc_add` enforces destination HTLC minimum, HTLC maximum, max HTLC count, max in-flight, and balance.
+- Do not forward back to the same hosted channel; that is invalid.
+
+For hosted-to-hosted settlement:
+
+- `ForwardLink` stores incoming scid/HTLC id, outgoing scid/HTLC id, payment hash, and optional shared secret.
+- Fulfill/fail from the downstream hosted channel is resolved upstream after commit.
+- Failure wrapping uses the stored shared secret when available.
+- Forward links are cleaned after settlement/failure resolution.
+
+## Real CLN HTLCs Routed Into Hosted Channels
+
+The CLN `htlc_accepted` hook can route real incoming LN HTLCs into a hosted channel.
+
+Important behavior:
+
+- `HtlcManager` parses the hook payload, determines target hosted peer, and calls `channel_handle_htlc_add`.
+- `channel_handle_htlc_add` persists a `ForwardLink` before sending `update_add_htlc` to the hosted peer.
+- The hook does not immediately return final success/failure. It waits for an async resolution, matching poncho-style behavior.
+- Startup grace period avoids resolving hooks too early while hosted channel state is being reconciled.
+- If a known preimage exists, the hook resolves immediately.
+
+## BOLT-4 Sphinx Onion Rules
+
+The Sphinx code in `sphinx.rs` is BOLT-4-sensitive. Key rules:
+
+- Payment onions for `update_add_htlc` authenticate with associated data equal to the HTLC `payment_hash`.
+- `peel_onion(node_privkey, onion, associated_data)` must be passed `&htlc.payment_hash` for payment HTLCs.
+- ECDH shared secret is `SHA256(compressed ECDH point)`.
+- HMAC verification is `HMAC256(mu, hop_payloads || associated_data)`.
+- HMAC comparison is constant-time.
+- Payloads use variable-length BigSize/TLV parsing.
+- `next_hmac` is extracted immediately and forwarded in the constructed next onion.
+- Final-hop payloads have no short_channel_id and produce an empty next onion.
+- Forwarded onions use the truncated unwrapped payloads and extracted next HMAC.
+
+Tests cover associated-data authentication and two-hop relay onion roundtrip. If changing Sphinx logic, add or update onion tests; do not rely only on integration tests.
+
+## Failure Handling
+
+Malformed hosted-origin onion peel:
+
+- Send `update_fail_malformed_htlc` upstream after commit.
+- Use the SHA256 of the original onion and failure code `0xc005`.
+
+Normal forwarding policy/amount failures:
+
+- Use local failure onion/wrapped failure helpers and `update_fail_htlc`.
+
+Downstream real-LN sendpay failure:
+
+- Look up `ForwardLink` by label/scid/id.
+- Wrap the failure onion for the hosted source if a shared secret exists.
+- Send failure upstream and delete the forward link.
+
+Downstream fulfill:
+
+- Verify/persist preimage.
+- Resolve upstream hosted or CLN HTLC.
+- Delete forward link.
+
+Empty hosted `update_fail_htlc.reason` from a peer is treated as an error condition.
+
+## Channel Resize And Override
+
+There are two different mechanisms:
+
+- Public admin `canopusd-setchannel` for per-channel configuration.
+- Wire-level poncho `resize_channel` extension for client-driven hosted capacity changes.
+
+Wire `resize_channel` behavior:
+
+- Requires prior `accepting_resize_sat` authorization.
+- Verifies client signature.
+- Refuses inactive channels and capacity above authorization.
+- Updates LCSS capacity and max in-flight to the new capacity.
+- Adjusts host/local balance by the capacity delta while preserving client/remote balance.
+- Updates routing `htlc_maximum_msat` to the new capacity.
+- Persists, sends `state_update`, records a resize ledger event, and sends/pends channel_update.
+
+Admin setchannel LCSS changes use `state_override`, not the wire resize message.
+
+Override/reset behavior:
+
+- `canopusd-reset` only works for `Errored` or `Overriding` channels.
+- It proposes a new LCSS with no HTLCs.
+- It increments both update counters.
+- If `new_local_balance_msat` is supplied, remote/client balance becomes `capacity - new_local_balance_msat`.
+
+## Secrets And Provisioning
+
+Secrets are one-time 32-byte values represented as 64-character hex strings.
+
+`canopusd-addsecret secret capacity_msat initial_balance_msat` stores a `ChannelSecret`. On invoke, if the client presents the secret:
+
+- The secret must be exactly 32 raw bytes after hex decode.
+- It is consumed atomically with datastore generation CAS.
+- The secret is then deleted.
+- Capacity and initial client balance override global policy for that channel's effective creation policy.
+- Other policy values come from current `effective_policy()`.
+- The new channel captures routing policy from that effective creation policy.
+
+If `require_secret=true`, invokes without a valid secret are silently ignored with a warning. If `require_secret=false`, a valid supplied secret still applies custom capacity/balance; invalid/nonexistent secrets fall back to default policy.
+
+## Direct Hosted `pay` Interception
+
+The `rpc_command` hook watches `pay` calls, parses BOLT11 invoices, detects single-hop hosted route hints, and sends a direct hosted HTLC.
+
+Important notes:
+
+- If no matching hosted invoice target is found, the hook returns `continue` and CLN handles payment normally.
+- If a preimage is already stored, it returns a CLN-compatible success response immediately.
+- Final CLTV currently uses current height + invoice min final CLTV + global `effective_policy().cltv_expiry_delta`.
+- This path still needs live cliche/CLN validation.
+
+## Node Key Handling
+
+`keys.rs` reads CLN `hsm_secret` directly and derives the node key. This is necessary because no CLN RPC provides the signatures required for hosted channel state.
+
+Supported formats:
+
+- Legacy plain secret.
+- Mnemonic without passphrase.
+- Mnemonic with passphrase.
+
+Passphrase-protected secrets start locked. `canopusd-unlock` rebuilds runtime with the passphrase, then zeroizes the passphrase buffer. Be careful not to log secrets or passphrases.
+
+## Ledger And Accounting
+
+The plugin maintains its own append-only ledger because CLN's bookkeeper cannot ingest plugin-managed hosted HTLCs as normal channel activity.
+
+Ledger behavior:
+
+- Channel open, resize, override, HTLC forwarded, HTLC fulfilled, and HTLC failed events are recorded.
+- `record_once` provides idempotency by event id.
+- `canopusd-events [peerid]` lists events.
+- Custom notifications are emitted for consumers.
+
+When adding new balance-affecting behavior, add ledger coverage or explicitly explain why no event should be recorded.
+
+## Preimage Scanner
+
+The scanner watches blocks for `OP_RETURN <32-byte-preimage>` pushes matching watched payment hashes.
+
+It uses `NodeActions::get_raw_block_by_height`, deserializes with the `bitcoin` crate, and stores discovered preimages through `NodeActions::store_preimage`.
+
+The scanner is a host-protection mechanism: if a client publishes a preimage on-chain, canopusd can learn it and settle/fail appropriately.
 
 ## Testing Patterns
 
-- **Unit tests** live in `#[cfg(test)] mod tests` at the bottom of each module. They test pure logic (codecs, sighash, state folding, config validation).
-- **Integration tests** live in `tests/integration.rs`. They use `make_harness()` which creates a `ChannelController` with `MemoryStore` + `MockNode`, and a fresh keypair for a simulated client.
-- The `establish_channel()` helper in integration tests performs the full invoke → init → state_update handshake and returns the host's LCSS. Reuse it.
-- To inspect messages sent to the peer, use `node.sent_messages.lock().unwrap()` — always scope in a block to avoid holding the guard across `.await`.
-- To simulate payment results, use `node.set_payment_result(label, PaymentStatus::Succeeded { preimage })`.
+Unit tests live in `#[cfg(test)] mod tests` at the bottom of modules. Integration tests live in `tests/integration.rs`.
+
+Integration helpers:
+
+- `make_harness(require_secret)` creates a `ChannelController`, `Arc<MockNode>`, client secret, and client pubkey.
+- `establish_channel()` performs invoke -> init -> state_update and returns host LCSS.
+- `establish_channel_with_secret()` provisions and establishes a secret-backed channel.
+- `commit_peer_updates()` folds uncommitted channel updates and sends the peer state_update in tests.
+- `last_sent_message()` decodes the last custom message emitted by `MockNode`.
+
+`MockNode` records:
+
+- `sent_messages`
+- `sent_onions`
+- `htlc_resolutions`
+- `notifications`
+- `payment_results`
+- `preimages`
+
+When asserting sent messages, filter by peer and message type. Many tests clear `sent_messages` after setup to avoid matching establishment messages.
+
+When testing override acceptance, build `accepted = override_lcss.reverse()`, sign with the client secret, and pass its counters/signature back via `StateUpdate`.
+
+## Live Interop And Validation Gaps
+
+The code compiles and mock tests cover a large surface, but production validation remains necessary for:
+
+- CLN RPC/datastore payload shapes and generation behavior.
+- CLN `sendonion` behavior with hosted-origin real-LN forwarding.
+- cliche/immortan/poncho wire framing and channel_update expectations.
+- Direct hosted `pay` interception against real invoices and route hints.
+- Reconnect behavior with offline clients receiving pending channel updates and overrides.
+- Legacy encrypted hsm_secret fixtures.
+
+No `TODO` or `stub` markers are expected in `src/` unless deliberately introduced as part of a tracked follow-up. Prefer adding tests for discovered edge cases immediately.
+
+## Common Pitfalls
+
+- Do not use global `effective_policy()` for existing hosted-channel fee checks unless the code is explicitly about global defaults. Existing channel routing uses `ChannelData.routing_policy`.
+- Do not mutate LCSS-backed fields silently. Use state_override-style flow for existing active channels.
+- Do not clear `channel_update_pending` before a channel_update send succeeds.
+- Do not treat `htlc_minimum_msat` as a routing-only field. It is signed in LCSS.
+- Do not treat `htlc_maximum_msat` as signed LCSS. It is advertised routing policy.
+- Do not enforce hosted fee/CLTV spread for hosted-origin real-LN forwarding. CLN validates real outgoing channel constraints.
+- Do not fail hosted-origin HTLCs before commit when the failure is a side effect of a committed add. Commit-then-fail is intentional.
+- Do not delete forward links before upstream resolution is safely persisted/sent.
+- Do not replay remote errors as local errors on reconnect.
+- Do not collapse strict and legacy framing behavior.
+- Do not modify sighash or endian details without comparing against scoin/poncho.
+- Do not introduce persistence schema fields without serde defaults or migration handling for existing CLN datastore entries.
