@@ -78,7 +78,7 @@ impl LedgerManager {
         fee_msat: u64,
         payment_hash: Option<&[u8; 32]>,
     ) -> Result<(), crate::store::StoreError> {
-        let marker_key = ["canopusd", "ledger_event_ids", event_id];
+        let marker_key = ["canopus", "ledger_event_ids", event_id];
         if self.store.exists(&marker_key).await? {
             return Ok(());
         }
@@ -107,7 +107,7 @@ impl LedgerManager {
         event_id: Option<String>,
     ) -> Result<(), crate::store::StoreError> {
         // Get and increment the sequence number
-        let meta_key = ["canopusd", "meta"];
+        let meta_key = ["canopus", "meta"];
         let (mut meta, gen) = match crate::store::get_json::<crate::store::Meta>(
             self.store.as_ref(),
             &meta_key,
@@ -144,11 +144,7 @@ impl LedgerManager {
                 .as_secs(),
         };
 
-        let key = [
-            "canopusd".to_string(),
-            "ledger".to_string(),
-            seq.to_string(),
-        ];
+        let key = ["canopus".to_string(), "ledger".to_string(), seq.to_string()];
         let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
         crate::store::create_json(self.store.as_ref(), &key_ref, &event).await?;
 
@@ -160,7 +156,7 @@ impl LedgerManager {
         &self,
         peer_pubkey: Option<&str>,
     ) -> Result<Vec<LedgerEvent>, crate::store::StoreError> {
-        let children = self.store.list(&["canopusd", "ledger"]).await?;
+        let children = self.store.list(&["canopus", "ledger"]).await?;
         let mut events = Vec::new();
         for child in children {
             let key_ref: Vec<&str> = child.iter().map(|s| s.as_str()).collect();

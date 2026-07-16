@@ -4,7 +4,7 @@
 //! `generation` for optimistic concurrency). In tests it is backed by an
 //! in-memory implementation with identical semantics.
 //!
-//! Key namespace (all under "canopusd"):
+//! Key namespace (all under "canopus"):
 //!   channels/<peer_pubkey_hex>     → ChannelData (JSON)
 //!   secrets/<secret_hex>           → ChannelSecret (JSON)
 //!   htlc_forwards/<scid>/<htlc_id> → ForwardLink (JSON)
@@ -452,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn create_get_update() {
         let store = MemoryStore::new();
-        let key = ["canopusd", "test", "key1"];
+        let key = ["canopus", "test", "key1"];
 
         store.create(&key, b"hello").await.unwrap();
         let gv = store.get(&key).await.unwrap();
@@ -569,7 +569,7 @@ mod tests {
     #[tokio::test]
     async fn channel_data_roundtrip() {
         let store = MemoryStore::new();
-        let key = ["canopusd", "channels", "deadbeef"];
+        let key = ["canopus", "channels", "deadbeef"];
 
         let data = ChannelData {
             lcss: LastCrossSignedState {

@@ -1,4 +1,4 @@
-# canopusd
+# canopus
 
 A bLIP-17 Hosted Channels HOST plugin for Core Lightning, written in Rust.
 
@@ -6,7 +6,7 @@ See [`ROADMAP.md`](ROADMAP.md) for production validation, hardening, and future 
 
 ## Overview
 
-`canopusd` implements the HOST side of the [Hosted Channels specification (bLIP-17)](https://github.com/lightning/blips/blob/master/blip-0017.md). Hosted channels are auditable Lightning-like channels backed by trust from a client in a host, providing an improvement over traditional custodial wallets.
+`canopus` implements the HOST side of the [Hosted Channels specification (bLIP-17)](https://github.com/lightning/blips/blob/master/blip-0017.md). Hosted channels are auditable Lightning-like channels backed by trust from a client in a host, providing an improvement over traditional custodial wallets.
 
 ### Features
 
@@ -27,20 +27,20 @@ See [`ROADMAP.md`](ROADMAP.md) for production validation, hardening, and future 
 cargo build --release
 ```
 
-The binary will be at `target/release/canopusd`.
+The binary will be at `target/release/canopus`.
 
 ## Installation
 
 Add to your `lightningd` config:
 
 ```ini
-plugin=/path/to/canopusd
+plugin=/path/to/canopus
 ```
 
 Or start lightningd with:
 
 ```bash
-lightningd --plugin=/path/to/canopusd
+lightningd --plugin=/path/to/canopus
 ```
 
 ### Requirements
@@ -56,143 +56,143 @@ All options can be set in the CLN config file or on the command line:
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `canopusd-contact-url` | string | URL for human contact (enables branding replies) |
-| `canopusd-color` | string | Hex color for branding (e.g. `#ff0000`) |
-| `canopusd-logo` | string | Path to PNG logo file (max 65535 bytes) |
+| `canopus-contact-url` | string | URL for human contact (enables branding replies) |
+| `canopus-color` | string | Hex color for branding (e.g. `#ff0000`) |
+| `canopus-logo` | string | Path to PNG logo file (max 65535 bytes) |
 
 ### Channel Policy
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `canopusd-capacity-msat` | int | 100000000 | Default channel capacity in millisatoshi |
-| `canopusd-initial-balance-msat` | int | 0 | Default initial client balance |
-| `canopusd-fee-base-msat` | int | 1000 | Base fee for forwarding |
-| `canopusd-fee-ppm` | int | 1000 | Proportional fee (parts per million) |
-| `canopusd-cltv-delta` | int | 137 | CLTV expiry delta |
-| `canopusd-htlc-min-msat` | int | 546000 | Minimum HTLC amount |
-| `canopusd-max-htlcs` | int | 12 | Max accepted HTLCs per channel |
-| `canopusd-max-inflight-msat` | int | 100000000 | Max HTLC value in flight |
+| `canopus-capacity-msat` | int | 100000000 | Default channel capacity in millisatoshi |
+| `canopus-initial-balance-msat` | int | 0 | Default initial client balance |
+| `canopus-fee-base-msat` | int | 1000 | Base fee for forwarding |
+| `canopus-fee-ppm` | int | 1000 | Proportional fee (parts per million) |
+| `canopus-cltv-delta` | int | 137 | CLTV expiry delta |
+| `canopus-htlc-min-msat` | int | 546000 | Minimum HTLC amount |
+| `canopus-max-htlcs` | int | 12 | Max accepted HTLCs per channel |
+| `canopus-max-inflight-msat` | int | 100000000 | Max HTLC value in flight |
 
 ### Other
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `canopusd-require-secret` | bool | true | Require a secret for channel invocation |
-| `canopusd-preimage-scan` | bool | true | Scan blocks for OP_RETURN-published preimages |
+| `canopus-require-secret` | bool | true | Require a secret for channel invocation |
+| `canopus-preimage-scan` | bool | true | Scan blocks for OP_RETURN-published preimages |
 
 ### Example
 
 ```ini
-plugin=/path/to/canopusd
-canopusd-contact-url=https://my-host.example.com
-canopusd-color=#0066cc
-canopusd-logo=/etc/lightning/logo.png
-canopusd-capacity-msat=500000000
-canopusd-require-secret=true
+plugin=/path/to/canopus
+canopus-contact-url=https://my-host.example.com
+canopus-color=#0066cc
+canopus-logo=/etc/lightning/logo.png
+canopus-capacity-msat=500000000
+canopus-require-secret=true
 ```
 
 ## RPC Commands
 
-### `canopusd-status`
+### `canopus-status`
 
 Show whether the plugin runtime is unlocked. If CLN's `hsm_secret` needs a passphrase, hosted-channel hooks stay in safe no-op/continue mode until unlock succeeds.
 
 ```bash
-lightning-cli canopusd-status
+lightning-cli canopus-status
 ```
 
-### `canopusd-unlock passphrase_file=...`
+### `canopus-unlock passphrase_file=...`
 
 Unlock a passphrase-protected CLN `hsm_secret`.
 
 ```bash
-lightning-cli canopusd-unlock passphrase_file=/run/secrets/canopusd-hsm-passphrase
+lightning-cli canopus-unlock passphrase_file=/run/secrets/canopus-hsm-passphrase
 ```
 
 Direct passphrase passing is supported but less secure because shell history, process listings, or logs may expose it. Prefer `passphrase_file`, or capture a shell prompt into a protected temporary file before invoking `lightning-cli`.
 
 ```bash
-lightning-cli canopusd-unlock passphrase='correct horse battery staple'
+lightning-cli canopus-unlock passphrase='correct horse battery staple'
 ```
 
-### `canopusd-list`
+### `canopus-list`
 
 List all hosted channels.
 
 ```bash
-lightning-cli canopusd-list
+lightning-cli canopus-list
 ```
 
-### `canopusd-channel peerid`
+### `canopus-channel peerid`
 
 Get detailed information about a specific channel, including the derived hosted `short_channel_id` in BOLT `blockheightxtxindexxoutnum` format.
 
 ```bash
-lightning-cli canopusd-channel 028789... 
+lightning-cli canopus-channel 028789... 
 ```
 
-### `canopusd-addsecret secret capacity_msat initial_balance_msat`
+### `canopus-addsecret secret capacity_msat initial_balance_msat`
 
 Add a one-time channel provisioning secret. The secret must be a 64-character hex string representing 32 random bytes. When a client invokes with this secret, they get a channel with the specified capacity and initial balance. The secret is consumed atomically on use.
 
 ```bash
 SECRET=$(openssl rand -hex 32)
-lightning-cli canopusd-addsecret "$SECRET" 500000000 100000000
+lightning-cli canopus-addsecret "$SECRET" 500000000 100000000
 ```
 
-### `canopusd-removesecret secret`
+### `canopus-removesecret secret`
 
 Remove an unused secret.
 
 ```bash
-lightning-cli canopusd-removesecret "$SECRET"
+lightning-cli canopus-removesecret "$SECRET"
 ```
 
-### `canopusd-listsecrets`
+### `canopus-listsecrets`
 
 List all secrets (hex-encoded, redacted).
 
 ```bash
-lightning-cli canopusd-listsecrets
+lightning-cli canopus-listsecrets
 ```
 
-### `canopusd-reset peerid [new_local_balance_msat]`
+### `canopus-reset peerid [new_local_balance_msat]`
 
 Reset an errored channel by proposing a `state_override`. Uses the last known counterparty-signed cross-signed state. Optionally specify a new local balance.
 
 ```bash
-lightning-cli canopusd-reset 028789... 80000000
+lightning-cli canopus-reset 028789... 80000000
 ```
 
-### `canopusd-policy [fields...]`
+### `canopus-policy [fields...]`
 
 Get or update the default hosted-channel policy used for new channels. Supported fields are `channel_capacity_msat`, `initial_client_balance_msat`, `max_htlc_value_in_flight_msat`, `htlc_minimum_msat`, `max_accepted_htlcs`, `fee_base_msat`, `fee_proportional_millionths`, and `cltv_expiry_delta`.
 
 ```bash
-lightning-cli canopusd-policy fee_base_msat=2000 fee_proportional_millionths=500 htlc_minimum_msat=1000 max_accepted_htlcs=24 cltv_expiry_delta=144
+lightning-cli canopus-policy fee_base_msat=2000 fee_proportional_millionths=500 htlc_minimum_msat=1000 max_accepted_htlcs=24 cltv_expiry_delta=144
 ```
 
-### `canopusd-setchannel peerid [fields...]`
+### `canopus-setchannel peerid [fields...]`
 
 Get or update per-channel hosted routing parameters. With only `peerid`, the command returns the current channel parameters. Optional fields update only when specified: `channel_capacity_msat`, `initial_client_balance_msat`, `feebase_msat`, `feeppm`, `cltv_expiry_delta`, `htlc_minimum_msat`, `htlc_maximum_msat`, and `maxhtlcs`.
 
-Updates are rejected while HTLCs are in flight. Routing-only changes are persisted immediately and announced with a fresh channel update. Changes to LCSS-backed fields such as channel capacity, client balance, HTLC minimum, or max HTLC count are rejected for active channels by default; use `canopusd-reset` on an errored channel for state-override recovery.
+Updates are rejected while HTLCs are in flight. Routing-only changes are persisted immediately and announced with a fresh channel update. Changes to LCSS-backed fields such as channel capacity, client balance, HTLC minimum, or max HTLC count are rejected for active channels by default; use `canopus-reset` on an errored channel for state-override recovery.
 
 Pass `force=true` or `--force` only for an explicit administrative override. This first puts the hosted channel into a local errored/overriding state, then persists and sends `error` followed by `state_override`; if the peer is offline, the proposal is replayed on reconnect.
 
-If the channel is already overriding, `canopusd-setchannel` updates the pending proposal and sends the latest `state_override` again. Reconnect replays only the last persisted proposal.
+If the channel is already overriding, `canopus-setchannel` updates the pending proposal and sends the latest `state_override` again. Reconnect replays only the last persisted proposal.
 
 ```bash
-lightning-cli canopusd-setchannel peerid=028789... feebase_msat=2000 feeppm=500 cltv_expiry_delta=144 htlc_maximum_msat=50000000
-lightning-cli canopusd-setchannel peerid=028789... channel_capacity_msat=120000000 force=true
+lightning-cli canopus-setchannel peerid=028789... feebase_msat=2000 feeppm=500 cltv_expiry_delta=144 htlc_maximum_msat=50000000
+lightning-cli canopus-setchannel peerid=028789... channel_capacity_msat=120000000 force=true
 ```
 
-### `canopusd-events [peerid]`
+### `canopus-events [peerid]`
 
 List accounting events, optionally filtered by peer.
 
 ```bash
-lightning-cli canopusd-events 028789...
+lightning-cli canopus-events 028789...
 ```
 
 ## Architecture
@@ -288,7 +288,7 @@ Since the sandbox environment doesn't have lightningd, bitcoind, or cliche insta
 
 1. Install [Core Lightning](https://github.com/ElementsProject/lightning) (v23.02+)
 2. Install [cliche](https://github.com/nbd-wtf/cliche) (bLIP-17 client)
-3. Build canopusd: `cargo build --release`
+3. Build canopus: `cargo build --release`
 
 ### Setup (regtest)
 
@@ -297,19 +297,19 @@ Since the sandbox environment doesn't have lightningd, bitcoind, or cliche insta
    bitcoind -regtest -daemon
    ```
 
-2. Start lightningd with canopusd:
+2. Start lightningd with canopus:
    ```bash
    lightningd --network=regtest \
-     --plugin=./target/release/canopusd \
-     --canopusd-contact-url=https://example.com \
-     --canopusd-color=#ff0000 \
-     --canopusd-require-secret=true
+     --plugin=./target/release/canopus \
+     --canopus-contact-url=https://example.com \
+     --canopus-color=#ff0000 \
+     --canopus-require-secret=true
    ```
 
 3. Add a provisioning secret:
    ```bash
    SECRET=$(openssl rand -hex 32)
-   lightning-cli canopusd-addsecret "$SECRET" 1000000000 500000000
+   lightning-cli canopus-addsecret "$SECRET" 1000000000 500000000
    ```
 
 4. Start cliche, configured to connect to your lightningd node.
@@ -318,7 +318,7 @@ Since the sandbox environment doesn't have lightningd, bitcoind, or cliche insta
 
 6. Verify the channel is established:
    ```bash
-   lightning-cli canopusd-list
+   lightning-cli canopus-list
    ```
 
 7. Send a payment through the hosted channel and verify it forwards correctly.
@@ -326,12 +326,12 @@ Since the sandbox environment doesn't have lightningd, bitcoind, or cliche insta
 8. Test error recovery:
    ```bash
    # Force an error (e.g., disconnect mid-payment)
-   lightning-cli canopusd-reset <peerid>
+   lightning-cli canopus-reset <peerid>
    ```
 
 9. Verify accounting:
    ```bash
-   lightning-cli canopusd-events <peerid>
+   lightning-cli canopus-events <peerid>
    ```
 
 ### Interop Notes

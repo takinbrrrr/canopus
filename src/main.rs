@@ -1,10 +1,10 @@
-use canopusd::channel;
-use canopusd::cln_node::ClnNode;
-use canopusd::cln_store::ClnStore;
-use canopusd::config::Config;
-use canopusd::keys::NodeKeys;
-use canopusd::ledger::LedgerManager;
-use canopusd::wire::{
+use canopus::channel;
+use canopus::cln_node::ClnNode;
+use canopus::cln_store::ClnStore;
+use canopus::config::Config;
+use canopus::keys::NodeKeys;
+use canopus::ledger::LedgerManager;
+use canopus::wire::{
     TAG_ANNOUNCEMENT_SIGNATURE, TAG_ASK_BRANDING_INFO, TAG_ERROR, TAG_HOSTED_CHANNEL_BRANDING,
     TAG_INIT_HOSTED_CHANNEL, TAG_INVOKE_HOSTED_CHANNEL, TAG_LAST_CROSS_SIGNED_STATE,
     TAG_PHC_CHANNEL_UPDATE_GOSSIP, TAG_PHC_CHANNEL_UPDATE_SYNC, TAG_QUERY_PREIMAGES,
@@ -43,55 +43,55 @@ pub enum RuntimeState {
 async fn main() -> anyhow::Result<()> {
     let builder = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(ConfigOption::new_str_no_default(
-            "canopusd-contact-url",
+            "canopus-contact-url",
             "URL for human contact (branding)",
         ))
         .option(ConfigOption::new_str_no_default(
-            "canopusd-color",
+            "canopus-color",
             "Hex color for branding (e.g. #ff0000)",
         ))
         .option(ConfigOption::new_str_no_default(
-            "canopusd-logo",
+            "canopus-logo",
             "Path to PNG logo file for branding (max 65535 bytes)",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-capacity-msat",
+            "canopus-capacity-msat",
             "Default channel capacity in millisatoshi",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-initial-balance-msat",
+            "canopus-initial-balance-msat",
             "Default initial client balance in millisatoshi",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-fee-base-msat",
+            "canopus-fee-base-msat",
             "Base fee in millisatoshi for forwarding",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-fee-ppm",
+            "canopus-fee-ppm",
             "Proportional fee in parts per million",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-cltv-delta",
+            "canopus-cltv-delta",
             "CLTV expiry delta for forwarded HTLCs",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-htlc-min-msat",
+            "canopus-htlc-min-msat",
             "Minimum HTLC amount in millisatoshi",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-max-htlcs",
+            "canopus-max-htlcs",
             "Maximum accepted HTLCs per channel",
         ))
         .option(ConfigOption::new_i64_no_default(
-            "canopusd-max-inflight-msat",
+            "canopus-max-inflight-msat",
             "Maximum HTLC value in flight per channel",
         ))
         .option(BooleanConfigOption::new_bool_no_default(
-            "canopusd-require-secret",
+            "canopus-require-secret",
             "Require a secret for channel invocation",
         ))
         .option(BooleanConfigOption::new_bool_no_default(
-            "canopusd-preimage-scan",
+            "canopus-preimage-scan",
             "Scan blocks for OP_RETURN-published preimages",
         ))
         .featurebits(
@@ -132,67 +132,67 @@ async fn main() -> anyhow::Result<()> {
         .hook("htlc_accepted", handler::handle_htlc_accepted)
         .hook("rpc_command", handler::handle_rpc_command)
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-list", handler::handle_list)
+            cln_plugin::RpcMethodBuilder::new("canopus-list", handler::handle_list)
                 .usage("")
-                .description("List all hosted channels known to canopusd, returning each peer id and derived channel status."),
+                .description("List all hosted channels known to canopus, returning each peer id and derived channel status."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-channel", handler::handle_channel)
+            cln_plugin::RpcMethodBuilder::new("canopus-channel", handler::handle_channel)
                 .usage("peerid")
                 .description("Show the full persisted hosted-channel state for peerid, including the current status and channel data. Returns null if no channel is known for that peer."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-removehc", handler::handle_remove_hc)
+            cln_plugin::RpcMethodBuilder::new("canopus-removehc", handler::handle_remove_hc)
                 .usage("peerid [force]")
                 .description("Remove the hosted channel for peerid. Refuses to remove channels with in-flight HTLCs or pending updates unless force=true or --force is passed."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-addsecret", handler::handle_add_secret)
+            cln_plugin::RpcMethodBuilder::new("canopus-addsecret", handler::handle_add_secret)
                 .usage("secret capacity_msat initial_balance_msat")
                 .description("Create a one-time channel provisioning secret. A client invoking a hosted channel with this secret receives the supplied total channel capacity and initial client balance, both in millisatoshi."),
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new(
-                "canopusd-removesecret",
+                "canopus-removesecret",
                 handler::handle_remove_secret,
             )
             .usage("secret")
             .description("Remove an unused channel provisioning secret so it can no longer be consumed by a hosted-channel client."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-listsecrets", handler::handle_list_secrets)
+            cln_plugin::RpcMethodBuilder::new("canopus-listsecrets", handler::handle_list_secrets)
                 .usage("")
                 .description("List configured channel provisioning secrets with secret values redacted. Use this to audit available one-time hosted-channel invitations."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-reset", handler::handle_reset)
+            cln_plugin::RpcMethodBuilder::new("canopus-reset", handler::handle_reset)
                 .usage("peerid [new_local_balance_msat]")
-                .description("Propose a state_override for an errored hosted channel. If new_local_balance_msat is provided, the override uses that local balance; otherwise canopusd proposes a reset from current state."),
+                .description("Propose a state_override for an errored hosted channel. If new_local_balance_msat is provided, the override uses that local balance; otherwise canopus proposes a reset from current state."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-setchannel", handler::handle_set_channel)
+            cln_plugin::RpcMethodBuilder::new("canopus-setchannel", handler::handle_set_channel)
                 .usage("peerid [channel_capacity_msat] [initial_client_balance_msat] [feebase_msat] [feeppm] [cltv_expiry_delta] [htlc_minimum_msat] [htlc_maximum_msat] [maxhtlcs]")
                 .description("Show or update per-channel hosted routing parameters for peerid. Omitted fields keep their current values; updates are refused while HTLCs are in flight."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-policy", handler::handle_policy)
+            cln_plugin::RpcMethodBuilder::new("canopus-policy", handler::handle_policy)
                 .usage("[channel_capacity_msat] [initial_client_balance_msat] [max_htlc_value_in_flight_msat] [htlc_minimum_msat] [max_accepted_htlcs] [fee_base_msat] [fee_proportional_millionths] [cltv_expiry_delta]")
                 .description("Show or update the default hosted-channel policy. Omitted fields keep their current values. These defaults apply to new channels and to invocations that do not consume a provisioning secret."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-events", handler::handle_events)
+            cln_plugin::RpcMethodBuilder::new("canopus-events", handler::handle_events)
                 .usage("[peerid]")
-                .description("List canopusd accounting events. When peerid is supplied, only events for that hosted-channel peer are returned."),
+                .description("List canopus accounting events. When peerid is supplied, only events for that hosted-channel peer are returned."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-status", handler::handle_status)
+            cln_plugin::RpcMethodBuilder::new("canopus-status", handler::handle_status)
                 .usage("")
-                .description("Show whether canopusd is locked or unlocked. When locked, the response includes the reason and hsm_secret path; when unlocked, it includes the node id."),
+                .description("Show whether canopus is locked or unlocked. When locked, the response includes the reason and hsm_secret path; when unlocked, it includes the node id."),
         )
         .rpcmethod_from_builder(
-            cln_plugin::RpcMethodBuilder::new("canopusd-unlock", handler::handle_unlock)
+            cln_plugin::RpcMethodBuilder::new("canopus-unlock", handler::handle_unlock)
                 .usage("passphrase | passphrase_file")
-                .description("Unlock canopusd when the CLN hsm_secret requires a passphrase. Provide exactly one of passphrase or passphrase_file. Prefer passphrase_file because direct passphrase arguments may be visible in shell history or process lists."),
+                .description("Unlock canopus when the CLN hsm_secret requires a passphrase. Provide exactly one of passphrase or passphrase_file. Prefer passphrase_file because direct passphrase arguments may be visible in shell history or process lists."),
         );
 
     let Some(configured) = builder.configure().await? else {
@@ -226,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     spawn_committed_htlc_recovery(runtime);
 
-    tracing::info!("canopusd plugin started");
+    tracing::info!("canopus plugin started");
     plugin.join().await?;
 
     Ok(())
@@ -275,8 +275,8 @@ fn spawn_committed_htlc_recovery(runtime: Arc<RwLock<RuntimeState>>) {
 }
 
 fn requires_unlock(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<canopusd::keys::KeyError>()
-        .is_some_and(|e| matches!(e, canopusd::keys::KeyError::PassphraseRequired(_)))
+    err.downcast_ref::<canopus::keys::KeyError>()
+        .is_some_and(|e| matches!(e, canopus::keys::KeyError::PassphraseRequired(_)))
 }
 
 fn config_from_options<S, I, O>(
@@ -288,43 +288,43 @@ where
     O: Send + tokio::io::AsyncWrite + Unpin + 'static,
 {
     let mut config = Config::default();
-    if let Some(Value::String(v)) = plugin.option_str("canopusd-contact-url")? {
+    if let Some(Value::String(v)) = plugin.option_str("canopus-contact-url")? {
         config.branding.contact_url = Some(v);
     }
-    if let Some(Value::String(v)) = plugin.option_str("canopusd-color")? {
+    if let Some(Value::String(v)) = plugin.option_str("canopus-color")? {
         config.branding.color = Some(v);
     }
-    if let Some(Value::String(v)) = plugin.option_str("canopusd-logo")? {
+    if let Some(Value::String(v)) = plugin.option_str("canopus-logo")? {
         config.branding.logo_path = Some(PathBuf::from(v));
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-capacity-msat")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-capacity-msat")? {
         config.policy.channel_capacity_msat = v as u64;
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-initial-balance-msat")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-initial-balance-msat")? {
         config.policy.initial_client_balance_msat = v as u64;
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-fee-base-msat")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-fee-base-msat")? {
         config.policy.fee_base_msat = v as u32;
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-fee-ppm")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-fee-ppm")? {
         config.policy.fee_proportional_millionths = v as u32;
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-cltv-delta")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-cltv-delta")? {
         config.policy.cltv_expiry_delta = v as u16;
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-htlc-min-msat")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-htlc-min-msat")? {
         config.policy.htlc_minimum_msat = v as u64;
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-max-htlcs")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-max-htlcs")? {
         config.policy.max_accepted_htlcs = v as u16;
     }
-    if let Some(Value::Integer(v)) = plugin.option_str("canopusd-max-inflight-msat")? {
+    if let Some(Value::Integer(v)) = plugin.option_str("canopus-max-inflight-msat")? {
         config.policy.max_htlc_value_in_flight_msat = v as u64;
     }
-    if let Some(Value::Boolean(v)) = plugin.option_str("canopusd-require-secret")? {
+    if let Some(Value::Boolean(v)) = plugin.option_str("canopus-require-secret")? {
         config.require_secret = v;
     }
-    if let Some(Value::Boolean(v)) = plugin.option_str("canopusd-preimage-scan")? {
+    if let Some(Value::Boolean(v)) = plugin.option_str("canopus-preimage-scan")? {
         config.preimage_scan = v;
     }
     config.validate()?;
@@ -365,13 +365,13 @@ fn compute_feature_bits_hex(bits: &[u64]) -> String {
 mod handler {
     use super::{build_runtime, spawn_committed_htlc_recovery, PluginState, RuntimeState};
     use bytes::Bytes;
-    use canopusd::channel::SetChannelParams;
-    use canopusd::channel_id::{
+    use canopus::channel::SetChannelParams;
+    use canopus::channel_id::{
         format_short_channel_id, hosted_short_channel_id, parse_short_channel_id,
     };
-    use canopusd::node::{HtlcResolution, PaymentStatus};
-    use canopusd::wire::codecs::UpdateAddHtlc;
-    use canopusd::wire::{
+    use canopus::node::{HtlcResolution, PaymentStatus};
+    use canopus::wire::codecs::UpdateAddHtlc;
+    use canopus::wire::{
         HostedMessage, TAG_ANNOUNCEMENT_SIGNATURE, TAG_ASK_BRANDING_INFO, TAG_ERROR,
         TAG_HOSTED_CHANNEL_BRANDING, TAG_INIT_HOSTED_CHANNEL, TAG_INVOKE_HOSTED_CHANNEL,
         TAG_LAST_CROSS_SIGNED_STATE, TAG_PHC_CHANNEL_UPDATE_GOSSIP, TAG_PHC_CHANNEL_UPDATE_SYNC,
@@ -389,28 +389,28 @@ mod handler {
 
     async fn controller(
         plugin: &Plugin<PluginState>,
-    ) -> Result<std::sync::Arc<canopusd::channel::ChannelController>, cln_plugin::Error> {
+    ) -> Result<std::sync::Arc<canopus::channel::ChannelController>, cln_plugin::Error> {
         match &*plugin.state().runtime.read().await {
             RuntimeState::Unlocked { controller, .. } => Ok(controller.clone()),
-            RuntimeState::Locked { reason } => Err(anyhow::anyhow!("canopusd locked: {reason}")),
+            RuntimeState::Locked { reason } => Err(anyhow::anyhow!("canopus locked: {reason}")),
         }
     }
 
     async fn cln_node(
         plugin: &Plugin<PluginState>,
-    ) -> Result<std::sync::Arc<canopusd::cln_node::ClnNode>, cln_plugin::Error> {
+    ) -> Result<std::sync::Arc<canopus::cln_node::ClnNode>, cln_plugin::Error> {
         match &*plugin.state().runtime.read().await {
             RuntimeState::Unlocked { cln_node, .. } => Ok(cln_node.clone()),
-            RuntimeState::Locked { reason } => Err(anyhow::anyhow!("canopusd locked: {reason}")),
+            RuntimeState::Locked { reason } => Err(anyhow::anyhow!("canopus locked: {reason}")),
         }
     }
 
     async fn ledger(
         plugin: &Plugin<PluginState>,
-    ) -> Result<std::sync::Arc<canopusd::ledger::LedgerManager>, cln_plugin::Error> {
+    ) -> Result<std::sync::Arc<canopus::ledger::LedgerManager>, cln_plugin::Error> {
         match &*plugin.state().runtime.read().await {
             RuntimeState::Unlocked { ledger, .. } => Ok(ledger.clone()),
-            RuntimeState::Locked { reason } => Err(anyhow::anyhow!("canopusd locked: {reason}")),
+            RuntimeState::Locked { reason } => Err(anyhow::anyhow!("canopus locked: {reason}")),
         }
     }
 
@@ -514,7 +514,7 @@ mod handler {
         })
     }
 
-    pub(super) fn is_canopusd_custom_tag(tag: u16) -> bool {
+    pub(super) fn is_canopus_custom_tag(tag: u16) -> bool {
         matches!(
             tag,
             TAG_INVOKE_HOSTED_CHANNEL
@@ -603,7 +603,7 @@ mod handler {
     }
 
     async fn hosted_invoice_target(
-        controller: &canopusd::channel::ChannelController,
+        controller: &canopus::channel::ChannelController,
         invoice: &Bolt11Invoice,
     ) -> Result<Option<PublicKey>, cln_plugin::Error> {
         for route in invoice.route_hints() {
@@ -776,7 +776,7 @@ mod handler {
         else {
             return Ok(hook_continue());
         };
-        if !is_canopusd_custom_tag(tag) {
+        if !is_canopus_custom_tag(tag) {
             return Ok(hook_continue());
         }
         let decoded = match HostedMessage::decode_legacy_aware(&bytes) {
@@ -798,7 +798,7 @@ mod handler {
             .note_peer_wire_encoding(&peer_id, decoded.encoding)
             .await;
         let msg = decoded.message;
-        let result: canopusd::channel::ChannelResult<()> = match msg {
+        let result: canopus::channel::ChannelResult<()> = match msg {
             HostedMessage::InvokeHostedChannel(m) => controller.handle_invoke(&peer_id, m).await,
             HostedMessage::LastCrossSignedState(m) => controller.handle_lcss(&peer_id, m).await,
             HostedMessage::StateUpdate(m) => controller.handle_state_update(&peer_id, m).await,
@@ -1284,7 +1284,7 @@ mod handler {
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
         if locked_reason(&plugin).await.is_none() {
-            anyhow::bail!("canopusd is already unlocked");
+            anyhow::bail!("canopus is already unlocked");
         }
 
         let mut passphrase = unlock_passphrase(&request)?;
@@ -1396,10 +1396,10 @@ mod tests {
     }
 
     #[test]
-    fn custom_tag_allowlist_matches_canopusd_tags() {
-        assert!(handler::is_canopusd_custom_tag(TAG_INVOKE_HOSTED_CHANNEL));
-        assert!(handler::is_canopusd_custom_tag(TAG_PHC_CHANNEL_UPDATE_SYNC));
-        assert!(!handler::is_canopusd_custom_tag(39409));
-        assert!(!handler::is_canopusd_custom_tag(2111));
+    fn custom_tag_allowlist_matches_canopus_tags() {
+        assert!(handler::is_canopus_custom_tag(TAG_INVOKE_HOSTED_CHANNEL));
+        assert!(handler::is_canopus_custom_tag(TAG_PHC_CHANNEL_UPDATE_SYNC));
+        assert!(!handler::is_canopus_custom_tag(39409));
+        assert!(!handler::is_canopus_custom_tag(2111));
     }
 }

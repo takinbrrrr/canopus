@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn create_params_omit_generation() {
         let params = ClnStore::datastore_params(
-            &["canopusd", "channels", "peer"],
+            &["canopus", "channels", "peer"],
             Some("00ff".to_string()),
             "must-create",
             None,
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(
             params,
             json!({
-                "key": ["canopusd", "channels", "peer"],
+                "key": ["canopus", "channels", "peer"],
                 "hex": "00ff",
                 "mode": "must-create",
             })
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn update_params_include_generation() {
         let params = ClnStore::datastore_params(
-            &["canopusd", "channels", "peer"],
+            &["canopus", "channels", "peer"],
             Some("00ff".to_string()),
             "must-replace",
             Some(42),
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(
             params,
             json!({
-                "key": ["canopusd", "channels", "peer"],
+                "key": ["canopus", "channels", "peer"],
                 "hex": "00ff",
                 "mode": "must-replace",
                 "generation": 42,
@@ -256,12 +256,12 @@ mod tests {
 
     #[test]
     fn optional_datastore_params_are_omitted() {
-        let params = ClnStore::datastore_params(&["canopusd", "key"], None, "must-create", None);
+        let params = ClnStore::datastore_params(&["canopus", "key"], None, "must-create", None);
 
         assert_eq!(
             params,
             json!({
-                "key": ["canopusd", "key"],
+                "key": ["canopus", "key"],
                 "mode": "must-create",
             })
         );

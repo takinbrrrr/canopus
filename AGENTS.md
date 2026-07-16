@@ -1,20 +1,20 @@
 # AGENTS.md
 
-Guide for AI agents working on the `canopusd` codebase.
+Guide for AI agents working on the `canopus` codebase.
 
 This file is intended to carry hard-won project context forward between sessions. Keep it accurate when behavior changes. The most important rule is to preserve protocol compatibility and funds-safety invariants before making code look cleaner.
 
 ## What This Project Is
 
-`canopusd` is a Rust plugin for Core Lightning (CLN) that implements the HOST side of bLIP-17 Hosted Channels. It is designed to interoperate with cliche, immortan, and the Scala reference host poncho.
+`canopus` is a Rust plugin for Core Lightning (CLN) that implements the HOST side of bLIP-17 Hosted Channels. It is designed to interoperate with cliche, immortan, and the Scala reference host poncho.
 
 Hosted channels are custodial Lightning-like channels. There is no on-chain funding transaction. The client trusts the host for custody, but both sides maintain an auditable off-chain state called `last_cross_signed_state` (LCSS). The host signs channel state with the CLN node key, and the client verifies against the host node pubkey.
 
-`canopusd` is not a generic Lightning node implementation. It is a CLN plugin that bridges hosted-channel peers to CLN functionality: custom messages, datastore, `htlc_accepted`, `sendonion`, `sendpay_success`/`sendpay_failure`, raw blocks, and plugin RPC methods.
+`canopus` is not a generic Lightning node implementation. It is a CLN plugin that bridges hosted-channel peers to CLN functionality: custom messages, datastore, `htlc_accepted`, `sendonion`, `sendpay_success`/`sendpay_failure`, raw blocks, and plugin RPC methods.
 
 ## Build And Test Commands
 
-Run these from `/workspace/canopusd`.
+Run these from `/workspace/canopus`.
 
 ```bash
 cargo build
@@ -88,11 +88,11 @@ tests/
 
 The plugin advertises custom feature bit 257 in init and node announcements. Do not call `Builder::dynamic()`; CLN requires non-dynamic plugins for custom feature bits, and `cln-plugin` defaults to non-dynamic.
 
-The plugin can start locked if the CLN `hsm_secret` requires a passphrase. While locked, hooks remain safe/no-op/continue. Unlock with `canopusd-unlock passphrase_file=...` or direct `passphrase=...`.
+The plugin can start locked if the CLN `hsm_secret` requires a passphrase. While locked, hooks remain safe/no-op/continue. Unlock with `canopus-unlock passphrase_file=...` or direct `passphrase=...`.
 
 ## RPC Argument Parsing
 
-All canopusd RPC handlers either take no args or support named arguments.
+All canopus RPC handlers either take no args or support named arguments.
 
 The helper behavior in `main.rs` is:
 
@@ -102,41 +102,41 @@ The helper behavior in `main.rs` is:
 Examples:
 
 ```bash
-lightning-cli canopusd-channel peerid=02...
-lightning-cli canopusd-channel 02...
-lightning-cli canopusd-setchannel peerid=02... feebase_msat=2000 feeppm=500
+lightning-cli canopus-channel peerid=02...
+lightning-cli canopus-channel 02...
+lightning-cli canopus-setchannel peerid=02... feebase_msat=2000 feeppm=500
 ```
 
 Registered RPC methods:
 
-- `canopusd-status`: no args. Shows locked/unlocked runtime state.
-- `canopusd-unlock`: supports `passphrase=...` or `passphrase_file=...` and requires exactly one.
-- `canopusd-list`: no args. Lists known hosted channels and derived status.
-- `canopusd-channel`: supports `peerid=...`; returns full persisted channel data.
-- `canopusd-removehc`: supports `peerid=...` and `force=...`; refuses removal with in-flight/pending HTLCs unless forced.
-- `canopusd-addsecret`: supports `secret=...`, `capacity_msat=...`, `initial_balance_msat=...`.
-- `canopusd-removesecret`: supports `secret=...`.
-- `canopusd-listsecrets`: no args.
-- `canopusd-reset`: supports `peerid=...`, optional `new_local_balance_msat=...`; recovery command for errored/overriding channels.
-- `canopusd-policy`: supports named policy fields; updates global defaults used for new channels.
-- `canopusd-setchannel`: supports `peerid=...` plus optional per-channel fields; see the channel policy section.
-- `canopusd-events`: supports optional `peerid=...`.
+- `canopus-status`: no args. Shows locked/unlocked runtime state.
+- `canopus-unlock`: supports `passphrase=...` or `passphrase_file=...` and requires exactly one.
+- `canopus-list`: no args. Lists known hosted channels and derived status.
+- `canopus-channel`: supports `peerid=...`; returns full persisted channel data.
+- `canopus-removehc`: supports `peerid=...` and `force=...`; refuses removal with in-flight/pending HTLCs unless forced.
+- `canopus-addsecret`: supports `secret=...`, `capacity_msat=...`, `initial_balance_msat=...`.
+- `canopus-removesecret`: supports `secret=...`.
+- `canopus-listsecrets`: no args.
+- `canopus-reset`: supports `peerid=...`, optional `new_local_balance_msat=...`; recovery command for errored/overriding channels.
+- `canopus-policy`: supports named policy fields; updates global defaults used for new channels.
+- `canopus-setchannel`: supports `peerid=...` plus optional per-channel fields; see the channel policy section.
+- `canopus-events`: supports optional `peerid=...`.
 
-The public `canopusd-resize` RPC was replaced by `canopusd-setchannel`. The wire-level poncho `resize_channel` custom message still exists and is handled internally for client-driven resize compatibility.
+The public `canopus-resize` RPC was replaced by `canopus-setchannel`. The wire-level poncho `resize_channel` custom message still exists and is handled internally for client-driven resize compatibility.
 
 ## Persisted Data Model
 
-All production persistence goes through CLN datastore via `ClnStore`; tests use `MemoryStore`. Data is JSON encoded under the `canopusd` namespace.
+All production persistence goes through CLN datastore via `ClnStore`; tests use `MemoryStore`. Data is JSON encoded under the `canopus` namespace.
 
 Important keys:
 
-- `canopusd/channels/<peer_pubkey_hex>` -> `ChannelData`
-- `canopusd/policy` -> global `ChannelPolicy`
-- `canopusd/secrets/<secret_hex>` -> one-time `ChannelSecret`
-- `canopusd/htlc_forwards/<scid>/<htlc_id>` -> `ForwardLink`
-- `canopusd/preimages/<payment_hash_hex>` -> preimage hex
-- `canopusd/ledger/<seq>` -> ledger event
-- `canopusd/meta` -> ledger sequence metadata
+- `canopus/channels/<peer_pubkey_hex>` -> `ChannelData`
+- `canopus/policy` -> global `ChannelPolicy`
+- `canopus/secrets/<secret_hex>` -> one-time `ChannelSecret`
+- `canopus/htlc_forwards/<scid>/<htlc_id>` -> `ForwardLink`
+- `canopus/preimages/<payment_hash_hex>` -> preimage hex
+- `canopus/ledger/<seq>` -> ledger event
+- `canopus/meta` -> ledger sequence metadata
 
 `ChannelData` contains:
 
@@ -160,7 +160,7 @@ There are two policy concepts now. Do not conflate them.
 Global policy:
 
 - Type: `ChannelPolicy` in `config.rs`.
-- Stored at `canopusd/policy` when changed by `canopusd-policy`.
+- Stored at `canopus/policy` when changed by `canopus-policy`.
 - Loaded by `effective_policy()`; falls back to startup config/defaults if not persisted.
 - Used for new channel creation and secret-derived effective policy.
 - Updating it does not mutate existing channels.
@@ -183,9 +183,9 @@ Per-channel state and routing policy:
 
 `htlc_maximum_msat` is a BOLT channel_update routing field, not an LCSS field. Historically it was derived from channel capacity; it is now stored per channel in `ChannelRoutingPolicy`.
 
-## `canopusd-setchannel` Semantics
+## `canopus-setchannel` Semantics
 
-`canopusd-setchannel peerid` with no optional fields is read-only and returns the current channel parameters. It is allowed even if HTLCs are in flight.
+`canopus-setchannel peerid` with no optional fields is read-only and returns the current channel parameters. It is allowed even if HTLCs are in flight.
 
 Optional fields update only when specified:
 
@@ -210,17 +210,17 @@ Routing-only updates:
 LCSS-affecting updates:
 
 - Affect `channel_capacity_msat`, `initial_client_balance_msat`, `htlc_minimum_msat`, or `maxhtlcs`.
-- Are rejected by `canopusd-setchannel` for active channels. cliche/immortan only records incoming `state_override` proposals after the hosted channel is already errored, so active administrative overrides are not interoperable.
-- With explicit `force=true` or `--force`, `canopusd-setchannel` first persists a local error and `proposed_override`, then sends hosted `error` followed by `state_override`. The channel status becomes `Overriding`; reconnect replays LCSS, local error, and the proposal if the peer was offline.
-- If the channel is already `Overriding`, `canopusd-setchannel` updates `ChannelData.proposed_override` without requiring force and sends the latest `state_override` again. Reconnect must only replay the last persisted proposal.
-- Use `canopusd-reset` on an errored/overriding channel for state-override recovery.
+- Are rejected by `canopus-setchannel` for active channels. cliche/immortan only records incoming `state_override` proposals after the hosted channel is already errored, so active administrative overrides are not interoperable.
+- With explicit `force=true` or `--force`, `canopus-setchannel` first persists a local error and `proposed_override`, then sends hosted `error` followed by `state_override`. The channel status becomes `Overriding`; reconnect replays LCSS, local error, and the proposal if the peer was offline.
+- If the channel is already `Overriding`, `canopus-setchannel` updates `ChannelData.proposed_override` without requiring force and sends the latest `state_override` again. Reconnect must only replay the last persisted proposal.
+- Use `canopus-reset` on an errored/overriding channel for state-override recovery.
 
 Balance semantics for setchannel and reset:
 
 - In host-side LCSS, `local_balance_msat` is host balance and `remote_balance_msat` is client balance.
-- `canopusd-reset peerid new_local_balance_msat` is different: it takes host/local balance and computes client/remote balance as `capacity - new_local_balance_msat`.
+- `canopus-reset peerid new_local_balance_msat` is different: it takes host/local balance and computes client/remote balance as `capacity - new_local_balance_msat`.
 
-Keep `canopusd-reset` as a separate emergency recovery command. It only works in `Errored` or `Overriding` status and clears HTLCs as part of reset. `canopusd-setchannel` is an administrative configuration command for healthy active channels and rejects in-flight HTLCs.
+Keep `canopus-reset` as a separate emergency recovery command. It only works in `Errored` or `Overriding` status and clears HTLCs as part of reset. `canopus-setchannel` is an administrative configuration command for healthy active channels and rejects in-flight HTLCs.
 
 ## Channel Updates
 
@@ -236,7 +236,7 @@ Channel updates are currently sent:
 - after initial channel establishment completes;
 - after accepted `state_override`;
 - after wire-level hosted `resize_channel` acceptance;
-- after successful routing-only `canopusd-setchannel` updates;
+- after successful routing-only `canopus-setchannel` updates;
 - on active hosted reconnect or CLN connect when `channel_update_pending` is true.
 
 If sending a channel_update fails, leave `channel_update_pending = true`. Do not clear it before a successful send.
@@ -282,7 +282,7 @@ Active reconnect sends the stored LCSS, replays uncommitted local updates exactl
 
 Errored/overriding reconnect sends the stored LCSS, sends a local error if present, and resends `state_override` if `proposed_override` exists.
 
-Pending channel updates are durable via `channel_update_pending`. Active reconnect and CLN connect attempt to flush them. This is required so routing-only `canopusd-setchannel` changes made while a client is offline are delivered on next connection.
+Pending channel updates are durable via `channel_update_pending`. Active reconnect and CLN connect attempt to flush them. This is required so routing-only `canopus-setchannel` changes made while a client is offline are delivered on next connection.
 
 The disconnect handler clears legacy session wire encoding. It otherwise relies on persisted state and reconnect reconciliation.
 
@@ -320,7 +320,7 @@ Known preimages are checked for idempotency. Preimages are persisted before rela
 
 ## Hosted-Origin Routing Behavior
 
-Hosted-origin means the client sends an `update_add_htlc` into canopusd, and after commit canopusd peels the onion and forwards either to another hosted channel or to real Lightning via CLN `sendonion`.
+Hosted-origin means the client sends an `update_add_htlc` into canopus, and after commit canopus peels the onion and forwards either to another hosted channel or to real Lightning via CLN `sendonion`.
 
 Basic checks always apply before forwarding:
 
@@ -332,7 +332,7 @@ For hosted-origin to real-LN forwarding:
 
 - Do not enforce host fee base, fee ppm, or host CLTV spread.
 - CLN validates the real outgoing channel constraints when `sendonion` is called.
-- canopusd still persists a `ForwardLink` before calling `sendonion`.
+- canopus still persists a `ForwardLink` before calling `sendonion`.
 - The `sendonion` label is `<outgoing_scid>/<outgoing_htlc_id>`.
 - `group_id` is `outgoing_scid / 100`; `part_id` is the outgoing HTLC id.
 
@@ -409,7 +409,7 @@ Empty hosted `update_fail_htlc.reason` from a peer is treated as an error condit
 
 There are two different mechanisms:
 
-- Public admin `canopusd-setchannel` for per-channel configuration.
+- Public admin `canopus-setchannel` for per-channel configuration.
 - Wire-level poncho `resize_channel` extension for client-driven hosted capacity changes.
 
 Wire `resize_channel` behavior:
@@ -422,11 +422,11 @@ Wire `resize_channel` behavior:
 - Updates routing `htlc_maximum_msat` to the new capacity.
 - Persists, sends `state_update`, records a resize ledger event, and sends/pends channel_update.
 
-Admin setchannel rejects LCSS-backed changes for active channels unless explicitly forced with `force=true` or `--force`. Forced setchannel changes deliberately put the channel in errored/overriding state before proposing `state_override`. Use `canopusd-reset` for ordinary errored-channel state override recovery, or the wire-level resize flow for client-driven hosted capacity changes.
+Admin setchannel rejects LCSS-backed changes for active channels unless explicitly forced with `force=true` or `--force`. Forced setchannel changes deliberately put the channel in errored/overriding state before proposing `state_override`. Use `canopus-reset` for ordinary errored-channel state override recovery, or the wire-level resize flow for client-driven hosted capacity changes.
 
 Override/reset behavior:
 
-- `canopusd-reset` only works for `Errored` or `Overriding` channels.
+- `canopus-reset` only works for `Errored` or `Overriding` channels.
 - It proposes a new LCSS with no HTLCs.
 - It increments both update counters.
 - If `new_local_balance_msat` is supplied, remote/client balance becomes `capacity - new_local_balance_msat`.
@@ -435,7 +435,7 @@ Override/reset behavior:
 
 Secrets are one-time 32-byte values represented as 64-character hex strings.
 
-`canopusd-addsecret secret capacity_msat initial_balance_msat` stores a `ChannelSecret`. On invoke, if the client presents the secret:
+`canopus-addsecret secret capacity_msat initial_balance_msat` stores a `ChannelSecret`. On invoke, if the client presents the secret:
 
 - The secret must be exactly 32 raw bytes after hex decode.
 - It is consumed atomically with datastore generation CAS.
@@ -467,7 +467,7 @@ Supported formats:
 - Mnemonic without passphrase.
 - Mnemonic with passphrase.
 
-Passphrase-protected secrets start locked. `canopusd-unlock` rebuilds runtime with the passphrase, then zeroizes the passphrase buffer. Be careful not to log secrets or passphrases.
+Passphrase-protected secrets start locked. `canopus-unlock` rebuilds runtime with the passphrase, then zeroizes the passphrase buffer. Be careful not to log secrets or passphrases.
 
 ## Ledger And Accounting
 
@@ -477,7 +477,7 @@ Ledger behavior:
 
 - Channel open, resize, override, HTLC forwarded, HTLC fulfilled, and HTLC failed events are recorded.
 - `record_once` provides idempotency by event id.
-- `canopusd-events [peerid]` lists events.
+- `canopus-events [peerid]` lists events.
 - Custom notifications are emitted for consumers.
 
 When adding new balance-affecting behavior, add ledger coverage or explicitly explain why no event should be recorded.
@@ -488,7 +488,7 @@ The scanner watches blocks for `OP_RETURN <32-byte-preimage>` pushes matching wa
 
 It uses `NodeActions::get_raw_block_by_height`, deserializes with the `bitcoin` crate, and stores discovered preimages through `NodeActions::store_preimage`.
 
-The scanner is a host-protection mechanism: if a client publishes a preimage on-chain, canopusd can learn it and settle/fail appropriately.
+The scanner is a host-protection mechanism: if a client publishes a preimage on-chain, canopus can learn it and settle/fail appropriately.
 
 ## Testing Patterns
 
@@ -531,7 +531,7 @@ No `TODO` or `stub` markers are expected in `src/` unless deliberately introduce
 ## Common Pitfalls
 
 - Do not use global `effective_policy()` for existing hosted-channel fee checks unless the code is explicitly about global defaults. Existing channel routing uses `ChannelData.routing_policy`.
-- Do not mutate LCSS-backed fields silently. Active `canopusd-setchannel` LCSS changes are rejected unless explicitly forced; forced changes must persist/send local error before `state_override` because cliche/immortan only accepts override proposals after an error.
+- Do not mutate LCSS-backed fields silently. Active `canopus-setchannel` LCSS changes are rejected unless explicitly forced; forced changes must persist/send local error before `state_override` because cliche/immortan only accepts override proposals after an error.
 - Do not clear `channel_update_pending` before a channel_update send succeeds.
 - Do not treat `htlc_minimum_msat` as a routing-only field. It is signed in LCSS.
 - Do not treat `htlc_maximum_msat` as signed LCSS. It is advertised routing policy.

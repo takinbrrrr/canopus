@@ -235,7 +235,7 @@ impl ChannelController {
     /// Get the store key for a channel.
     fn channel_key(peer_id: &PublicKey) -> Vec<String> {
         vec![
-            "canopusd".to_string(),
+            "canopus".to_string(),
             "channels".to_string(),
             hex::encode(peer_id.serialize()),
         ]
@@ -244,7 +244,7 @@ impl ChannelController {
     /// Get the store key for a secret.
     fn secret_key(secret: &[u8]) -> Vec<String> {
         vec![
-            "canopusd".to_string(),
+            "canopus".to_string(),
             "secrets".to_string(),
             hex::encode(secret),
         ]
@@ -277,7 +277,7 @@ impl ChannelController {
     /// Get the store key for an HTLC forward.
     pub fn forward_key(scid: u64, htlc_id: u64) -> Vec<String> {
         vec![
-            "canopusd".to_string(),
+            "canopus".to_string(),
             "htlc_forwards".to_string(),
             scid.to_string(),
             htlc_id.to_string(),
@@ -288,7 +288,7 @@ impl ChannelController {
     #[allow(dead_code)]
     fn preimage_key(payment_hash: &[u8; 32]) -> Vec<String> {
         vec![
-            "canopusd".to_string(),
+            "canopus".to_string(),
             "preimages".to_string(),
             hex::encode(payment_hash),
         ]
@@ -361,7 +361,7 @@ impl ChannelController {
     }
 
     fn policy_key() -> Vec<String> {
-        vec!["canopusd".to_string(), "policy".to_string()]
+        vec!["canopus".to_string(), "policy".to_string()]
     }
 
     pub async fn effective_policy(&self) -> ChannelResult<ChannelPolicy> {
@@ -1864,7 +1864,7 @@ impl ChannelController {
 
     /// List all secrets (redacted).
     pub async fn list_secrets(&self) -> ChannelResult<Vec<String>> {
-        let children = self.store.list(&["canopusd", "secrets"]).await?;
+        let children = self.store.list(&["canopus", "secrets"]).await?;
         Ok(children
             .into_iter()
             .map(|c| c.last().cloned().unwrap_or_default())
@@ -2316,14 +2316,11 @@ impl ChannelController {
         incoming_scid: u64,
         incoming_htlc_id: u64,
     ) -> ChannelResult<Option<ForwardLink>> {
-        for scid_key in self.store.list(&["canopusd", "htlc_forwards"]).await? {
+        for scid_key in self.store.list(&["canopus", "htlc_forwards"]).await? {
             let Some(scid) = scid_key.last() else {
                 continue;
             };
-            let htlc_keys = self
-                .store
-                .list(&["canopusd", "htlc_forwards", scid])
-                .await?;
+            let htlc_keys = self.store.list(&["canopus", "htlc_forwards", scid]).await?;
             for key in htlc_keys {
                 let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
                 let (link, _) = match crate::store::get_json::<ForwardLink>(
@@ -2852,7 +2849,7 @@ impl ChannelController {
 
     /// List all channel peer pubkeys.
     pub async fn list_channels(&self) -> ChannelResult<Vec<PublicKey>> {
-        let children = self.store.list(&["canopusd", "channels"]).await?;
+        let children = self.store.list(&["canopus", "channels"]).await?;
         let mut peers = Vec::new();
         for child in children {
             if let Some(hex_id) = child.last() {
@@ -2887,7 +2884,7 @@ impl ChannelController {
         let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id).to_string();
         for key in self
             .store
-            .list(&["canopusd", "htlc_forwards", &hosted_scid])
+            .list(&["canopus", "htlc_forwards", &hosted_scid])
             .await?
         {
             let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();

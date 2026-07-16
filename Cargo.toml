@@ -1,16 +1,16 @@
 [package]
-name = "canopusd"
+name = "canopus"
 version = "0.1.0"
 edition = "2021"
 description = "A bLIP-17 Hosted Channels HOST plugin for Core Lightning"
 license = "CC0-1.0"
 
 [[bin]]
-name = "canopusd"
+name = "canopus"
 path = "src/main.rs"
 
 [lib]
-name = "canopusd"
+name = "canopus"
 path = "src/lib.rs"
 
 [dependencies]

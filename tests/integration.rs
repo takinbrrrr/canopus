@@ -1,15 +1,15 @@
 use bytes::Bytes;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
-use canopusd::channel::{ChannelController, SetChannelParams, Status};
-use canopusd::channel_id::hosted_short_channel_id;
-use canopusd::config::Config;
-use canopusd::node::{HtlcResolution, MockNode, NodeActions};
-use canopusd::state::StateManager;
-use canopusd::store::{get_json, ForwardLink, MemoryStore, UncommittedUpdate};
-use canopusd::wire::codecs::UpdateAddHtlc;
-use canopusd::wire::lcss::LastCrossSignedState;
-use canopusd::wire::{
+use canopus::channel::{ChannelController, SetChannelParams, Status};
+use canopus::channel_id::hosted_short_channel_id;
+use canopus::config::Config;
+use canopus::node::{HtlcResolution, MockNode, NodeActions};
+use canopus::state::StateManager;
+use canopus::store::{get_json, ForwardLink, MemoryStore, UncommittedUpdate};
+use canopus::wire::codecs::UpdateAddHtlc;
+use canopus::wire::lcss::LastCrossSignedState;
+use canopus::wire::{
     HostedMessage, InvokeHostedChannel, QueryPreimages, ResizeChannel, StateUpdate, UpdateFailHtlc,
     UpdateFulfillHtlc,
 };
@@ -235,14 +235,14 @@ async fn test_full_channel_establishment() {
     assert_eq!(lcss.local_updates, 0);
     assert_eq!(lcss.remote_updates, 0);
 
-    let ledger = canopusd::ledger::LedgerManager::new(controller.store.clone());
+    let ledger = canopus::ledger::LedgerManager::new(controller.store.clone());
     let events = ledger
         .list_events(Some(&hex::encode(client_public.serialize())))
         .await
         .unwrap();
     assert!(events.iter().any(|event| matches!(
         event.event_type,
-        canopusd::ledger::LedgerEventType::ChannelOpen
+        canopus::ledger::LedgerEventType::ChannelOpen
     )));
 }
 
@@ -389,7 +389,7 @@ async fn test_error_and_reset() {
 
     // Use the public method through mark_errored (which is private, so we
     // simulate by sending an error message from the peer)
-    use canopusd::wire::HcError;
+    use canopus::wire::HcError;
     let err = HcError {
         channel_id: [0; 32],
         data: Bytes::from_static(b"test error from peer"),
@@ -493,7 +493,7 @@ async fn test_active_idle_state_update_is_ignored() {
 
 #[tokio::test]
 async fn test_remote_error_not_replayed_on_reconnect() {
-    use canopusd::wire::HcError;
+    use canopus::wire::HcError;
 
     let (controller, node, client_secret, client_public) = make_harness(false).await;
     let _lcss = establish_channel(&controller, &node, &client_secret, &client_public).await;
@@ -718,7 +718,7 @@ async fn test_state_update_accepts_client_view_counters() {
         payment_hash: [1; 32],
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_single_hop_onion(
+            canopus::sphinx::create_single_hop_onion(
                 &client_public,
                 10_000_000,
                 700_100,
@@ -768,7 +768,7 @@ async fn test_state_update_accepts_client_view_counters() {
     assert_eq!(data.lcss.outgoing_htlcs.len(), 1);
     assert_eq!(data.lcss.outgoing_htlcs[0].htlc_id(), 1);
 
-    let ledger = canopusd::ledger::LedgerManager::new(controller.store.clone());
+    let ledger = canopus::ledger::LedgerManager::new(controller.store.clone());
     let events = ledger
         .list_events(Some(&hex::encode(client_public.serialize())))
         .await
@@ -778,7 +778,7 @@ async fn test_state_update_accepts_client_view_counters() {
             .iter()
             .filter(|event| matches!(
                 event.event_type,
-                canopusd::ledger::LedgerEventType::HtlcForwarded
+                canopus::ledger::LedgerEventType::HtlcForwarded
             ) && event.amount_msat == 10_000_000)
             .count(),
         1
@@ -820,7 +820,7 @@ async fn test_fulfill_after_client_view_state_update_resolves_upstream() {
         payment_hash,
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_single_hop_onion(
+            canopus::sphinx::create_single_hop_onion(
                 &client_public,
                 10_000_000,
                 700_100,
@@ -898,7 +898,7 @@ async fn test_duplicate_remote_fulfill_is_idempotent_and_repaired_on_reconnect()
         payment_hash,
         cltv_expiry: 700_100,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_single_hop_onion(
+            canopus::sphinx::create_single_hop_onion(
                 &client_public,
                 10_000_000,
                 700_100,
@@ -961,7 +961,7 @@ async fn test_duplicate_remote_fulfill_is_idempotent_and_repaired_on_reconnect()
     assert_eq!(data.uncommitted.len(), 1);
     assert!(matches!(
         data.uncommitted[0],
-        UncommittedUpdate::Remote(canopusd::store::PendingUpdate::Fulfill { id: 1, .. })
+        UncommittedUpdate::Remote(canopus::store::PendingUpdate::Fulfill { id: 1, .. })
     ));
 
     let duplicate = data.uncommitted[0].clone();
@@ -1050,7 +1050,7 @@ async fn test_remove_channel_requires_force_with_inflight_htlcs() {
     let hosted_scid = hosted_short_channel_id(&controller.node_public, &client_public).to_string();
     assert!(controller
         .store
-        .list(&["canopusd", "htlc_forwards", &hosted_scid])
+        .list(&["canopus", "htlc_forwards", &hosted_scid])
         .await
         .unwrap()
         .is_empty());
@@ -1239,13 +1239,13 @@ async fn test_hosted_to_hosted_fulfill_returns_to_source_peer() {
     let target_amount = 10_000_000;
     let target_cltv = 700_100;
     let source_htlc = UpdateAddHtlc {
-        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &source_public),
         id: 1,
         amount_msat: source_amount,
         payment_hash,
         cltv_expiry: 700_300,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_relay_onion(
+            canopus::sphinx::create_relay_onion(
                 &controller.node_public,
                 &target_public,
                 target_scid,
@@ -1380,13 +1380,13 @@ async fn test_hosted_to_hosted_fail_returns_to_source_peer() {
     let payment_hash = [0x52u8; 32];
     let target_scid = hosted_short_channel_id(&controller.node_public, &target_public);
     let source_htlc = UpdateAddHtlc {
-        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &source_public),
         id: 1,
         amount_msat: 10_011_000,
         payment_hash,
         cltv_expiry: 700_300,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_relay_onion(
+            canopus::sphinx::create_relay_onion(
                 &controller.node_public,
                 &target_public,
                 target_scid,
@@ -1554,13 +1554,13 @@ async fn test_hosted_origin_real_ln_ignores_host_fee_and_cltv_policy() {
     let amount_msat = 10_000_000;
     let cltv_expiry = 700_100;
     let source_htlc = UpdateAddHtlc {
-        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &source_public),
         id: 1,
         amount_msat,
         payment_hash,
         cltv_expiry,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_relay_onion(
+            canopus::sphinx::create_relay_onion(
                 &controller.node_public,
                 &next_public,
                 real_scid,
@@ -1609,13 +1609,13 @@ async fn test_hosted_origin_sendonion_setup_failure_fails_htlc() {
     let amount_msat = 10_000_000;
     let cltv_expiry = 700_100;
     let source_htlc = UpdateAddHtlc {
-        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &source_public),
         id: 1,
         amount_msat,
         payment_hash,
         cltv_expiry,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_relay_onion(
+            canopus::sphinx::create_relay_onion(
                 &controller.node_public,
                 &next_public,
                 real_scid,
@@ -1682,13 +1682,13 @@ async fn test_recovery_redrives_committed_hosted_origin_htlc() {
     let amount_msat = 10_000_000;
     let cltv_expiry = 700_100;
     let htlc = UpdateAddHtlc {
-        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &source_public),
         id: 1,
         amount_msat,
         payment_hash,
         cltv_expiry,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_relay_onion(
+            canopus::sphinx::create_relay_onion(
                 &controller.node_public,
                 &next_public,
                 real_scid,
@@ -1739,7 +1739,7 @@ async fn test_reconnect_queries_preimages_for_committed_outgoing_htlcs() {
     let payment_hash = [0x57u8; 32];
     let amount_msat = 1_000_000;
     let htlc = UpdateAddHtlc {
-        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &client_public),
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &client_public),
         id: 1,
         amount_msat,
         payment_hash,
@@ -1828,13 +1828,13 @@ async fn test_hosted_to_hosted_still_enforces_host_policy() {
     let source_amount_msat = 10_020_000;
     let cltv_expiry = 700_100;
     let source_htlc = UpdateAddHtlc {
-        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &source_public),
         id: 1,
         amount_msat: source_amount_msat,
         payment_hash,
         cltv_expiry: 700_300,
         onion_routing_packet: Bytes::from(
-            canopusd::sphinx::create_relay_onion(
+            canopus::sphinx::create_relay_onion(
                 &controller.node_public,
                 &target_public,
                 target_scid,
@@ -2420,7 +2420,7 @@ async fn test_set_channel_rejects_updates_with_pending_htlcs() {
         .handle_update_add(
             &client_public,
             UpdateAddHtlc {
-                channel_id: canopusd::channel_id::channel_id(
+                channel_id: canopus::channel_id::channel_id(
                     &controller.node_public,
                     &client_public,
                 ),
@@ -2536,12 +2536,12 @@ async fn test_htlc_resolution_with_known_preimage() {
 #[tokio::test]
 async fn test_ledger_records_events() {
     let store = Arc::new(MemoryStore::new());
-    let ledger = canopusd::ledger::LedgerManager::new(store);
+    let ledger = canopus::ledger::LedgerManager::new(store);
 
     ledger
         .record(
             "deadbeef",
-            canopusd::ledger::LedgerEventType::ChannelOpen,
+            canopus::ledger::LedgerEventType::ChannelOpen,
             100_000_000,
             0,
             None,
@@ -2559,19 +2559,19 @@ async fn test_datastore_generation_cas() {
     let store = Arc::new(MemoryStore::new());
 
     // Create a value
-    canopusd::store::create_json(&*store, &["test", "cas"], &serde_json::json!({"n": 0}))
+    canopus::store::create_json(&*store, &["test", "cas"], &serde_json::json!({"n": 0}))
         .await
         .unwrap();
 
     // CAS update should work
-    canopusd::store::cas_json::<serde_json::Value, _, _>(&*store, &["test", "cas"], |v| {
+    canopus::store::cas_json::<serde_json::Value, _, _>(&*store, &["test", "cas"], |v| {
         v["n"] = serde_json::json!(1);
         Ok(())
     })
     .await
     .unwrap();
 
-    let (val, gen) = canopusd::store::get_json::<serde_json::Value>(&*store, &["test", "cas"])
+    let (val, gen) = canopus::store::get_json::<serde_json::Value>(&*store, &["test", "cas"])
         .await
         .unwrap();
     assert_eq!(val["n"], 1);
@@ -2588,13 +2588,13 @@ async fn test_sphinx_key_derivation() {
 
     // Different keys should produce different ECDH results
     let _pk1 = secp256k1::PublicKey::from_secret_key(&secp, &sk1);
-    let r1 = canopusd::sphinx::peel_onion(&sk1, &[0u8; 1366], &[0u8; 32]);
-    let r2 = canopusd::sphinx::peel_onion(&sk2, &[0u8; 1366], &[0u8; 32]);
+    let r1 = canopus::sphinx::peel_onion(&sk1, &[0u8; 1366], &[0u8; 32]);
+    let r2 = canopus::sphinx::peel_onion(&sk2, &[0u8; 1366], &[0u8; 32]);
     // Both should fail (invalid onion) but not panic
     assert!(r1.is_err());
     assert!(r2.is_err());
 
     // Failure onion wrap should produce 256 bytes
-    let wrapped = canopusd::sphinx::wrap_failure(&shared, b"test");
+    let wrapped = canopus::sphinx::wrap_failure(&shared, b"test");
     assert_eq!(wrapped.len(), 256);
 }

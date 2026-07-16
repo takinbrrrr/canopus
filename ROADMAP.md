@@ -1,10 +1,10 @@
 # Roadmap
 
-This file tracks production validation, hardening, and future compatibility work for `canopusd`.
+This file tracks production validation, hardening, and future compatibility work for `canopus`.
 
 ## Production Validation
 
-- Build an automated regtest harness with `bitcoind`, Core Lightning, `canopusd`, and a hosted-channel client such as `cliche`.
+- Build an automated regtest harness with `bitcoind`, Core Lightning, `canopus`, and a hosted-channel client such as `cliche`.
 - Validate CLN hook payload shapes for `custommsg`, `htlc_accepted`, `sendpay_success`, `sendpay_failure`, and `rpc_command` against real `lightningd`.
 - Validate direct hosted `pay` interception against real `lightningd` and `cliche` invoices.
 - Validate CLN datastore generation/CAS semantics against real `lightningd`.
@@ -42,7 +42,7 @@ This file tracks production validation, hardening, and future compatibility work
 ## Operations
 
 - Add explicit `hsm_secret` ownership and permission checks with clear startup errors.
-- Document backup and restore procedures for `canopusd` datastore keys.
+- Document backup and restore procedures for `canopus` datastore keys.
 - Document an errored-channel recovery playbook.
 - Add a compatibility matrix for bLIP-17, poncho, cliche, and CLN versions.
 - Add structured operational logging guidance for peer id, scid, HTLC id, payment hash, datastore generation, and side-effect actions.

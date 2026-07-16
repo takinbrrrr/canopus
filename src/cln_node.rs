@@ -283,7 +283,7 @@ impl NodeActions for ClnNode {
         self.call(
             "datastore",
             json!({
-                "key": ["canopusd", "preimages", hex::encode(payment_hash)],
+                "key": ["canopus", "preimages", hex::encode(payment_hash)],
                 "hex": hex::encode(preimage),
                 "mode": "create-or-replace",
             }),
@@ -296,7 +296,7 @@ impl NodeActions for ClnNode {
         let response = self
             .call(
                 "listdatastore",
-                json!({ "key": ["canopusd", "preimages", hex::encode(payment_hash)] }),
+                json!({ "key": ["canopus", "preimages", hex::encode(payment_hash)] }),
             )
             .await?;
         let Some(entry) = response
@@ -319,7 +319,7 @@ impl NodeActions for ClnNode {
     async fn delete_preimage(&self, payment_hash: &[u8; 32]) -> NodeResult<()> {
         self.call(
             "deldatastore",
-            json!({ "key": ["canopusd", "preimages", hex::encode(payment_hash)] }),
+            json!({ "key": ["canopus", "preimages", hex::encode(payment_hash)] }),
         )
         .await?;
         Ok(())

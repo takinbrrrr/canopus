@@ -1,4 +1,4 @@
-//! Configuration for the canopusd plugin.
+//! Configuration for the canopus plugin.
 //!
 //! Options are accepted from the CLN config file or command line.
 //! The CLN plugin framework parses them and passes them to us in the
