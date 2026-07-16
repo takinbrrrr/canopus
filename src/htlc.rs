@@ -214,6 +214,9 @@ impl HtlcManager {
             PaymentStatus::Pending => {
                 // Still waiting — do nothing
             }
+            PaymentStatus::Unknown => {
+                // No outgoing payment record exists.
+            }
         }
     }
 

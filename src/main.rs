@@ -215,14 +215,16 @@ async fn main() -> anyhow::Result<()> {
         Err(err) => return Err(err),
     };
 
+    let runtime = Arc::new(RwLock::new(runtime));
     let plugin = configured
         .start(PluginState {
-            runtime: Arc::new(RwLock::new(runtime)),
+            runtime: runtime.clone(),
             config,
             rpc_path,
             hsm_secret_path,
         })
         .await?;
+    spawn_committed_htlc_recovery(runtime);
 
     tracing::info!("canopusd plugin started");
     plugin.join().await?;
@@ -254,6 +256,22 @@ async fn build_runtime(
         cln_node,
         ledger,
     })
+}
+
+fn spawn_committed_htlc_recovery(runtime: Arc<RwLock<RuntimeState>>) {
+    tokio::spawn(async move {
+        let controller = {
+            match &*runtime.read().await {
+                RuntimeState::Unlocked { controller, .. } => Some(controller.clone()),
+                RuntimeState::Locked { .. } => None,
+            }
+        };
+        if let Some(controller) = controller {
+            if let Err(err) = controller.recover_committed_htlcs().await {
+                tracing::warn!(error_message = %err, "failed to recover committed hosted HTLCs on startup");
+            }
+        }
+    });
 }
 
 fn requires_unlock(err: &anyhow::Error) -> bool {
@@ -345,7 +363,7 @@ fn compute_feature_bits_hex(bits: &[u64]) -> String {
 
 /// Plugin handlers — bridge CLN plugin messages to the channel controller.
 mod handler {
-    use super::{build_runtime, PluginState, RuntimeState};
+    use super::{build_runtime, spawn_committed_htlc_recovery, PluginState, RuntimeState};
     use bytes::Bytes;
     use canopusd::channel::SetChannelParams;
     use canopusd::channel_id::{
@@ -555,6 +573,25 @@ mod handler {
         request.get(key).unwrap_or(request)
     }
 
+    pub(super) fn sendpay_failure_payload(payload: &Value) -> Bytes {
+        if let Some(bytes) = payload
+            .get("onionreply")
+            .or_else(|| payload.get("erroronion"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .filter(|bytes| !bytes.is_empty())
+        {
+            return Bytes::from(bytes);
+        }
+
+        let failcode = payload
+            .get("failcode")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(0x1007);
+        Bytes::copy_from_slice(&failcode.to_be_bytes())
+    }
+
     fn rpc_param<'a>(request: &'a Value, key: &str, index: usize) -> Option<&'a Value> {
         let params = request
             .get("rpc_command")
@@ -682,27 +719,13 @@ mod handler {
         else {
             return Ok(());
         };
-        if payload.get("status").and_then(|v| v.as_str()) == Some("pending") {
-            return Ok(());
-        }
         if is_locked(&plugin).await {
             return Ok(());
         }
-        let onion = payload
-            .get("onionreply")
-            .or_else(|| payload.get("erroronion"))
-            .and_then(|v| v.as_str())
-            .and_then(|s| hex::decode(s).ok())
-            .unwrap_or_default();
+        let failure_onion = sendpay_failure_payload(payload);
         controller(&plugin)
             .await?
-            .handle_outgoing_payment_result(
-                scid,
-                htlc_id,
-                PaymentStatus::Failed {
-                    failure_onion: Bytes::from(onion),
-                },
-            )
+            .handle_outgoing_payment_result(scid, htlc_id, PaymentStatus::Failed { failure_onion })
             .await?;
         Ok(())
     }
@@ -775,38 +798,41 @@ mod handler {
             .note_peer_wire_encoding(&peer_id, decoded.encoding)
             .await;
         let msg = decoded.message;
-        match msg {
-            HostedMessage::InvokeHostedChannel(m) => controller.handle_invoke(&peer_id, m).await?,
-            HostedMessage::LastCrossSignedState(m) => controller.handle_lcss(&peer_id, m).await?,
-            HostedMessage::StateUpdate(m) => controller.handle_state_update(&peer_id, m).await?,
-            HostedMessage::UpdateAddHtlc(m) => controller.handle_update_add(&peer_id, m).await?,
+        let result: canopusd::channel::ChannelResult<()> = match msg {
+            HostedMessage::InvokeHostedChannel(m) => controller.handle_invoke(&peer_id, m).await,
+            HostedMessage::LastCrossSignedState(m) => controller.handle_lcss(&peer_id, m).await,
+            HostedMessage::StateUpdate(m) => controller.handle_state_update(&peer_id, m).await,
+            HostedMessage::UpdateAddHtlc(m) => controller.handle_update_add(&peer_id, m).await,
             HostedMessage::UpdateFulfillHtlc(m) => {
-                controller.handle_update_fulfill(&peer_id, m).await?
+                controller.handle_update_fulfill(&peer_id, m).await
             }
-            HostedMessage::UpdateFailHtlc(m) => controller.handle_update_fail(&peer_id, m).await?,
+            HostedMessage::UpdateFailHtlc(m) => controller.handle_update_fail(&peer_id, m).await,
             HostedMessage::UpdateFailMalformedHtlc(m) => {
-                controller.handle_update_fail_malformed(&peer_id, m).await?
+                controller.handle_update_fail_malformed(&peer_id, m).await
             }
-            HostedMessage::ResizeChannel(m) => {
-                controller.handle_resize_channel(&peer_id, m).await?
-            }
+            HostedMessage::ResizeChannel(m) => controller.handle_resize_channel(&peer_id, m).await,
             HostedMessage::QueryPreimages(m) => {
-                controller.handle_query_preimages(&peer_id, m).await?
+                controller.handle_query_preimages(&peer_id, m).await
             }
             HostedMessage::ReplyPreimages(m) => {
-                controller.handle_reply_preimages(&peer_id, m).await?
+                controller.handle_reply_preimages(&peer_id, m).await
             }
-            HostedMessage::Error(m) => controller.handle_error(&peer_id, m).await?,
-            HostedMessage::AskBrandingInfo(m) => {
-                controller.handle_ask_branding(&peer_id, m).await?
-            }
+            HostedMessage::Error(m) => controller.handle_error(&peer_id, m).await,
+            HostedMessage::AskBrandingInfo(m) => controller.handle_ask_branding(&peer_id, m).await,
             HostedMessage::StateOverride(_)
             | HostedMessage::InitHostedChannel(_)
             | HostedMessage::HostedChannelBranding(_)
             | HostedMessage::AnnouncementSignature(_)
             | HostedMessage::QueryPublicHostedChannels(_)
             | HostedMessage::ReplyPublicHostedChannelsEnd(_)
-            | HostedMessage::PhcChannelUpdate(_) => {}
+            | HostedMessage::PhcChannelUpdate(_) => Ok(()),
+        };
+        if let Err(err) = result {
+            tracing::warn!(
+                %peer_id,
+                error_message = %err,
+                "hosted custommsg processing failed"
+            );
         }
         Ok(hook_continue())
     }
@@ -1224,7 +1250,8 @@ mod handler {
         let controller = controller(&plugin).await?;
         let short_channel_id =
             format_short_channel_id(hosted_short_channel_id(&controller.node_public, &peer));
-        let (channel, updated) = controller.set_channel(&peer, params).await?;
+        let force = parse_force(param(&request, "force").or_else(|| arg(&request, 1, "force")));
+        let (channel, updated) = controller.set_channel(&peer, params, force).await?;
         Ok(json!({
             "peer_id": peer.to_string(),
             "short_channel_id": short_channel_id,
@@ -1278,6 +1305,7 @@ mod handler {
             }
         };
         *plugin.state().runtime.write().await = runtime;
+        spawn_committed_htlc_recovery(plugin.state().runtime.clone());
         Ok(json!({ "status": "unlocked", "locked": false, "node_id": node_id }))
     }
 }
@@ -1321,6 +1349,34 @@ mod tests {
         assert_eq!(
             handler::htlc_fail_temp_channel_failure(),
             serde_json::json!({ "result": "fail", "failure_message": "1007" })
+        );
+    }
+
+    #[test]
+    fn sendpay_failure_payload_uses_failure_onion_when_present() {
+        let payload = serde_json::json!({
+            "status": "pending",
+            "onionreply": "01020304",
+            "failcode": 4103,
+        });
+
+        assert_eq!(
+            handler::sendpay_failure_payload(&payload).as_ref(),
+            &[1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn sendpay_failure_payload_falls_back_to_failcode() {
+        let payload = serde_json::json!({
+            "status": "pending",
+            "failcode": 4103,
+            "failcodename": "WIRE_TEMPORARY_CHANNEL_FAILURE",
+        });
+
+        assert_eq!(
+            handler::sendpay_failure_payload(&payload).as_ref(),
+            &[0x10, 0x07]
         );
     }
 

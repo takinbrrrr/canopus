@@ -176,10 +176,15 @@ lightning-cli canopusd-policy fee_base_msat=2000 fee_proportional_millionths=500
 
 Get or update per-channel hosted routing parameters. With only `peerid`, the command returns the current channel parameters. Optional fields update only when specified: `channel_capacity_msat`, `initial_client_balance_msat`, `feebase_msat`, `feeppm`, `cltv_expiry_delta`, `htlc_minimum_msat`, `htlc_maximum_msat`, and `maxhtlcs`.
 
-Updates are rejected while HTLCs are in flight. Changes to LCSS-backed fields such as channel capacity, client balance, HTLC minimum, or max HTLC count create a pending `state_override`; routing-only changes are persisted immediately and announced with a fresh channel update.
+Updates are rejected while HTLCs are in flight. Routing-only changes are persisted immediately and announced with a fresh channel update. Changes to LCSS-backed fields such as channel capacity, client balance, HTLC minimum, or max HTLC count are rejected for active channels by default; use `canopusd-reset` on an errored channel for state-override recovery.
+
+Pass `force=true` or `--force` only for an explicit administrative override. This first puts the hosted channel into a local errored/overriding state, then persists and sends `error` followed by `state_override`; if the peer is offline, the proposal is replayed on reconnect.
+
+If the channel is already overriding, `canopusd-setchannel` updates the pending proposal and sends the latest `state_override` again. Reconnect replays only the last persisted proposal.
 
 ```bash
 lightning-cli canopusd-setchannel peerid=028789... feebase_msat=2000 feeppm=500 cltv_expiry_delta=144 htlc_maximum_msat=50000000
+lightning-cli canopusd-setchannel peerid=028789... channel_capacity_msat=120000000 force=true
 ```
 
 ### `canopusd-events [peerid]`

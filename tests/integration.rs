@@ -6,7 +6,7 @@ use canopusd::channel_id::hosted_short_channel_id;
 use canopusd::config::Config;
 use canopusd::node::{HtlcResolution, MockNode, NodeActions};
 use canopusd::state::StateManager;
-use canopusd::store::{get_json, ForwardLink, MemoryStore};
+use canopusd::store::{get_json, ForwardLink, MemoryStore, UncommittedUpdate};
 use canopusd::wire::codecs::UpdateAddHtlc;
 use canopusd::wire::lcss::LastCrossSignedState;
 use canopusd::wire::{
@@ -413,9 +413,18 @@ async fn test_error_and_reset() {
         Status::Overriding
     );
 
-    // Verify state_override was sent
-    let msg = last_sent_message(&node);
-    assert!(matches!(msg, HostedMessage::StateOverride(_)));
+    // cliche only records state_override proposals after the channel is errored.
+    {
+        let sent = node.sent_messages.lock().unwrap();
+        assert!(matches!(
+            HostedMessage::decode(&sent[sent.len() - 2].1).unwrap(),
+            HostedMessage::Error(_)
+        ));
+        assert!(matches!(
+            HostedMessage::decode(&sent[sent.len() - 1].1).unwrap(),
+            HostedMessage::StateOverride(_)
+        ));
+    }
 
     // Client accepts override
     let override_lcss = controller
@@ -868,6 +877,116 @@ async fn test_fulfill_after_client_view_state_update_resolves_upstream() {
     assert!(resolutions.iter().any(|(key, resolution)| matches!(
         resolution,
         HtlcResolution::Resolve { preimage: resolved } if key == "1/1" && resolved == &preimage
+    )));
+}
+
+#[tokio::test]
+async fn test_duplicate_remote_fulfill_is_idempotent_and_repaired_on_reconnect() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let preimage = [0x43u8; 32];
+    let payment_hash = {
+        use sha2::Digest;
+        sha2::Sha256::digest(preimage).into()
+    };
+    let htlc = UpdateAddHtlc {
+        channel_id: [0u8; 32],
+        id: 0,
+        amount_msat: 10_000_000,
+        payment_hash,
+        cltv_expiry: 700_100,
+        onion_routing_packet: Bytes::from(
+            canopusd::sphinx::create_single_hop_onion(
+                &client_public,
+                10_000_000,
+                700_100,
+                None,
+                &payment_hash,
+            )
+            .unwrap(),
+        ),
+        tlv_stream: Bytes::new(),
+    };
+    controller
+        .channel_handle_htlc_add(&client_public, htlc, "1/20", 1, 20, Some([9; 32]))
+        .await
+        .unwrap();
+
+    let data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut sm = StateManager::new(data.lcss.clone());
+    sm.uncommitted = data.uncommitted.clone();
+    let mut host_next = sm.lcss_next().unwrap();
+    host_next.sign(&controller.node_secret).unwrap();
+    let mut client_view = host_next.reverse();
+    client_view.sign(&client_secret).unwrap();
+    controller
+        .handle_state_update(
+            &client_public,
+            StateUpdate {
+                block_day: client_view.block_day,
+                local_updates: client_view.local_updates,
+                remote_updates: client_view.remote_updates,
+                local_sig_of_remote: client_view.local_sig_of_remote,
+            },
+        )
+        .await
+        .unwrap();
+
+    let fulfill = UpdateFulfillHtlc {
+        channel_id: host_next.outgoing_htlcs[0].channel_id,
+        id: 1,
+        payment_preimage: preimage,
+        tlv_stream: Bytes::new(),
+    };
+    controller
+        .handle_update_fulfill(&client_public, fulfill.clone())
+        .await
+        .unwrap();
+    controller
+        .handle_update_fulfill(&client_public, fulfill)
+        .await
+        .unwrap();
+
+    let mut data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.uncommitted.len(), 1);
+    assert!(matches!(
+        data.uncommitted[0],
+        UncommittedUpdate::Remote(canopusd::store::PendingUpdate::Fulfill { id: 1, .. })
+    ));
+
+    let duplicate = data.uncommitted[0].clone();
+    data.uncommitted.push(duplicate);
+    controller
+        .save_channel(&client_public, &data, None)
+        .await
+        .unwrap();
+
+    node.sent_messages.lock().unwrap().clear();
+    controller
+        .handle_invoke(&client_public, make_invoke(""))
+        .await
+        .unwrap();
+
+    let repaired = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.uncommitted.len(), 1);
+    let sent = node.sent_messages.lock().unwrap();
+    assert!(sent.iter().any(|(_, bytes)| matches!(
+        HostedMessage::decode(bytes).unwrap(),
+        HostedMessage::StateUpdate(_)
     )));
 }
 
@@ -1541,6 +1660,138 @@ async fn test_hosted_origin_sendonion_setup_failure_fails_htlc() {
 }
 
 #[tokio::test]
+async fn test_recovery_redrives_committed_hosted_origin_htlc() {
+    let (controller, node, source_secret, source_public) = make_harness(false).await;
+    let secp = Secp256k1::new();
+    let (_, next_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &source_secret,
+        &source_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let payment_hash = [0x56u8; 32];
+    let real_scid = 5_061_345_003_001;
+    let amount_msat = 10_000_000;
+    let cltv_expiry = 700_100;
+    let htlc = UpdateAddHtlc {
+        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &source_public),
+        id: 1,
+        amount_msat,
+        payment_hash,
+        cltv_expiry,
+        onion_routing_packet: Bytes::from(
+            canopusd::sphinx::create_relay_onion(
+                &controller.node_public,
+                &next_public,
+                real_scid,
+                amount_msat,
+                cltv_expiry,
+                &payment_hash,
+            )
+            .unwrap(),
+        ),
+        tlv_stream: Bytes::new(),
+    };
+    let mut data = controller
+        .load_channel(&source_public)
+        .await
+        .unwrap()
+        .unwrap();
+    data.lcss.remote_balance_msat -= amount_msat;
+    data.lcss.remote_updates += 1;
+    data.lcss.incoming_htlcs.push(htlc);
+    controller
+        .save_channel(&source_public, &data, None)
+        .await
+        .unwrap();
+
+    controller.recover_committed_htlcs().await.unwrap();
+
+    let onions = node.sent_onions.lock().unwrap();
+    assert_eq!(onions.len(), 1);
+    assert_eq!(onions[0].first_scid, real_scid);
+    assert_eq!(onions[0].first_amount_msat, amount_msat);
+}
+
+#[tokio::test]
+async fn test_reconnect_queries_preimages_for_committed_outgoing_htlcs() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &client_secret,
+        &client_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let payment_hash = [0x57u8; 32];
+    let amount_msat = 1_000_000;
+    let htlc = UpdateAddHtlc {
+        channel_id: canopusd::channel_id::channel_id(&controller.node_public, &client_public),
+        id: 1,
+        amount_msat,
+        payment_hash,
+        cltv_expiry: 700_100,
+        onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
+    };
+    let mut data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    data.lcss.local_balance_msat -= amount_msat;
+    data.lcss.local_updates += 1;
+    data.lcss.outgoing_htlcs.push(htlc);
+    controller
+        .save_channel(&client_public, &data, None)
+        .await
+        .unwrap();
+
+    controller.handle_connect(&client_public).await.unwrap();
+
+    let (query_count, add_count) = {
+        let sent = node.sent_messages.lock().unwrap();
+        let query_count = sent
+            .iter()
+            .filter(|(peer, bytes)| {
+                peer == &client_public
+                    && matches!(
+                        HostedMessage::decode(bytes),
+                        Ok(HostedMessage::QueryPreimages(QueryPreimages { ref hashes }))
+                            if hashes == &vec![payment_hash]
+                    )
+            })
+            .count();
+        let add_count = sent
+            .iter()
+            .filter(|(peer, bytes)| {
+                peer == &client_public
+                    && matches!(
+                        HostedMessage::decode(bytes),
+                        Ok(HostedMessage::UpdateAddHtlc(_))
+                    )
+            })
+            .count();
+        (query_count, add_count)
+    };
+    assert_eq!(query_count, 1);
+    assert_eq!(add_count, 0);
+}
+
+#[tokio::test]
 async fn test_hosted_to_hosted_still_enforces_host_policy() {
     let (controller, node, source_secret, source_public) = make_harness(false).await;
     let secp = Secp256k1::new();
@@ -1565,6 +1816,7 @@ async fn test_hosted_to_hosted_still_enforces_host_policy() {
                 fee_proportional_millionths: Some(0),
                 ..SetChannelParams::default()
             },
+            false,
         )
         .await
         .unwrap();
@@ -1724,7 +1976,7 @@ async fn test_set_channel_reads_and_updates_routing_policy() {
     node.sent_messages.lock().unwrap().clear();
 
     let (current, updated) = controller
-        .set_channel(&client_public, SetChannelParams::default())
+        .set_channel(&client_public, SetChannelParams::default(), false)
         .await
         .unwrap();
     assert!(!updated);
@@ -1741,6 +1993,7 @@ async fn test_set_channel_reads_and_updates_routing_policy() {
                 htlc_maximum_msat: Some(50_000_000),
                 ..SetChannelParams::default()
             },
+            false,
         )
         .await
         .unwrap();
@@ -1777,7 +2030,45 @@ async fn test_set_channel_reads_and_updates_routing_policy() {
 }
 
 #[tokio::test]
-async fn test_set_channel_lcss_update_creates_pending_override() {
+async fn test_set_channel_rejects_active_lcss_update() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let err = controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                channel_capacity_msat: Some(120_000_000),
+                initial_client_balance_msat: Some(10_000_000),
+                htlc_minimum_msat: Some(1_000),
+                max_accepted_htlcs: Some(8),
+                ..SetChannelParams::default()
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("LCSS-backed channel changes require an errored channel reset"));
+
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(data.proposed_override.is_none());
+    assert!(!data.channel_update_pending);
+    assert_eq!(
+        data.lcss.init_hosted_channel.channel_capacity_msat,
+        100_000_000
+    );
+    assert!(node.sent_messages.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_set_channel_force_errors_and_proposes_lcss_override() {
     let (controller, node, client_secret, client_public) = make_harness(false).await;
     establish_channel(&controller, &node, &client_secret, &client_public).await;
     node.sent_messages.lock().unwrap().clear();
@@ -1789,24 +2080,121 @@ async fn test_set_channel_lcss_update_creates_pending_override() {
                 channel_capacity_msat: Some(120_000_000),
                 initial_client_balance_msat: Some(10_000_000),
                 htlc_minimum_msat: Some(1_000),
+                htlc_maximum_msat: Some(60_000_000),
                 max_accepted_htlcs: Some(8),
                 ..SetChannelParams::default()
             },
+            true,
         )
         .await
         .unwrap();
     assert!(updated);
-    assert!(current.override_pending);
     assert_eq!(current.channel_capacity_msat, 120_000_000);
-    assert_eq!(current.remote_balance_msat, 10_000_000);
+    assert_eq!(current.initial_client_balance_msat, 10_000_000);
     assert_eq!(current.local_balance_msat, 110_000_000);
+    assert_eq!(current.remote_balance_msat, 10_000_000);
     assert_eq!(current.htlc_minimum_msat, 1_000);
+    assert_eq!(current.htlc_maximum_msat, 60_000_000);
     assert_eq!(current.maxhtlcs, 8);
+    assert!(current.override_pending);
+    assert!(current.channel_update_pending);
 
-    assert!(matches!(
-        last_sent_message(&node),
-        HostedMessage::StateOverride(_)
-    ));
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Overriding
+    );
+
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.local_errors, vec!["forced channel parameter override"]);
+    assert_eq!(
+        data.lcss.init_hosted_channel.channel_capacity_msat,
+        100_000_000
+    );
+    let override_lcss = data.proposed_override.clone().unwrap();
+    assert_eq!(
+        override_lcss.init_hosted_channel.channel_capacity_msat,
+        120_000_000
+    );
+    assert_eq!(override_lcss.remote_balance_msat, 10_000_000);
+    assert_eq!(override_lcss.local_balance_msat, 110_000_000);
+    assert_eq!(data.routing_policy.unwrap().htlc_maximum_msat, 60_000_000);
+
+    {
+        let sent = node.sent_messages.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        match HostedMessage::decode(&sent[0].1).unwrap() {
+            HostedMessage::Error(err) => {
+                assert_eq!(err.data.as_ref(), b"forced channel parameter override");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+        match HostedMessage::decode(&sent[1].1).unwrap() {
+            HostedMessage::StateOverride(msg) => {
+                assert_eq!(msg.local_balance_msat, 110_000_000);
+                assert_eq!(msg.local_updates, override_lcss.local_updates);
+                assert_eq!(msg.remote_updates, override_lcss.remote_updates);
+                assert_eq!(msg.local_sig_of_remote, override_lcss.local_sig_of_remote);
+            }
+            other => panic!("expected state_override, got {other:?}"),
+        }
+    }
+
+    let mut accepted = override_lcss.reverse();
+    accepted.sign(&client_secret).unwrap();
+    controller
+        .handle_state_update(
+            &client_public,
+            StateUpdate {
+                block_day: override_lcss.block_day,
+                local_updates: accepted.local_updates,
+                remote_updates: accepted.remote_updates,
+                local_sig_of_remote: accepted.local_sig_of_remote,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Active
+    );
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(data.local_errors.is_empty());
+    assert!(data.proposed_override.is_none());
+    assert!(!data.channel_update_pending);
+    assert_eq!(
+        data.lcss.init_hosted_channel.channel_capacity_msat,
+        120_000_000
+    );
+    assert_eq!(data.lcss.remote_balance_msat, 10_000_000);
+    assert_eq!(data.lcss.local_balance_msat, 110_000_000);
+}
+
+#[tokio::test]
+async fn test_set_channel_force_replays_override_on_reconnect() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                channel_capacity_msat: Some(120_000_000),
+                ..SetChannelParams::default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
     let override_lcss = controller
         .get_channel_data(&client_public)
         .await
@@ -1814,6 +2202,113 @@ async fn test_set_channel_lcss_update_creates_pending_override() {
         .unwrap()
         .proposed_override
         .unwrap();
+
+    node.sent_messages.lock().unwrap().clear();
+    controller
+        .handle_invoke(&client_public, make_invoke(""))
+        .await
+        .unwrap();
+
+    let sent = node.sent_messages.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    assert!(matches!(
+        HostedMessage::decode(&sent[0].1).unwrap(),
+        HostedMessage::LastCrossSignedState(_)
+    ));
+    match HostedMessage::decode(&sent[1].1).unwrap() {
+        HostedMessage::Error(err) => {
+            assert_eq!(err.data.as_ref(), b"forced channel parameter override");
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+    match HostedMessage::decode(&sent[2].1).unwrap() {
+        HostedMessage::StateOverride(msg) => {
+            assert_eq!(msg.local_balance_msat, override_lcss.local_balance_msat);
+            assert_eq!(msg.local_updates, override_lcss.local_updates);
+            assert_eq!(msg.remote_updates, override_lcss.remote_updates);
+            assert_eq!(msg.local_sig_of_remote, override_lcss.local_sig_of_remote);
+        }
+        other => panic!("expected state_override, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_set_channel_updates_pending_override() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                channel_capacity_msat: Some(120_000_000),
+                initial_client_balance_msat: Some(10_000_000),
+                ..SetChannelParams::default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    node.sent_messages.lock().unwrap().clear();
+
+    let (current, updated) = controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                channel_capacity_msat: Some(130_000_000),
+                htlc_minimum_msat: Some(2_000),
+                htlc_maximum_msat: Some(70_000_000),
+                ..SetChannelParams::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(updated);
+    assert_eq!(current.channel_capacity_msat, 130_000_000);
+    assert_eq!(current.initial_client_balance_msat, 10_000_000);
+    assert_eq!(current.local_balance_msat, 120_000_000);
+    assert_eq!(current.remote_balance_msat, 10_000_000);
+    assert_eq!(current.htlc_minimum_msat, 2_000);
+    assert_eq!(current.htlc_maximum_msat, 70_000_000);
+    assert!(current.override_pending);
+
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        data.lcss.init_hosted_channel.channel_capacity_msat,
+        100_000_000
+    );
+    let override_lcss = data.proposed_override.clone().unwrap();
+    assert_eq!(
+        override_lcss.init_hosted_channel.channel_capacity_msat,
+        130_000_000
+    );
+    assert_eq!(override_lcss.init_hosted_channel.htlc_minimum_msat, 2_000);
+    assert_eq!(override_lcss.remote_balance_msat, 10_000_000);
+    assert_eq!(override_lcss.local_balance_msat, 120_000_000);
+    assert_eq!(data.routing_policy.unwrap().htlc_maximum_msat, 70_000_000);
+
+    {
+        let sent = node.sent_messages.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(matches!(
+            HostedMessage::decode(&sent[0].1).unwrap(),
+            HostedMessage::Error(_)
+        ));
+        match HostedMessage::decode(&sent[1].1).unwrap() {
+            HostedMessage::StateOverride(msg) => {
+                assert_eq!(msg.local_balance_msat, override_lcss.local_balance_msat);
+                assert_eq!(msg.local_sig_of_remote, override_lcss.local_sig_of_remote);
+            }
+            other => panic!("expected state_override, got {other:?}"),
+        }
+    }
+
     let mut accepted = override_lcss.reverse();
     accepted.sign(&client_secret).unwrap();
     controller
@@ -1835,12 +2330,77 @@ async fn test_set_channel_lcss_update_creates_pending_override() {
         .unwrap()
         .unwrap();
     assert!(data.proposed_override.is_none());
-    assert!(!data.channel_update_pending);
     assert_eq!(
         data.lcss.init_hosted_channel.channel_capacity_msat,
-        120_000_000
+        130_000_000
     );
-    assert_eq!(data.lcss.remote_balance_msat, 10_000_000);
+    assert_eq!(data.lcss.local_balance_msat, 120_000_000);
+}
+
+#[tokio::test]
+async fn test_set_channel_reconnect_replays_only_latest_override() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                channel_capacity_msat: Some(120_000_000),
+                ..SetChannelParams::default()
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    let first_override = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap()
+        .proposed_override
+        .unwrap();
+
+    controller
+        .set_channel(
+            &client_public,
+            SetChannelParams {
+                channel_capacity_msat: Some(130_000_000),
+                ..SetChannelParams::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let latest_override = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap()
+        .proposed_override
+        .unwrap();
+    assert_ne!(
+        first_override.local_sig_of_remote,
+        latest_override.local_sig_of_remote
+    );
+
+    node.sent_messages.lock().unwrap().clear();
+    controller
+        .handle_invoke(&client_public, make_invoke(""))
+        .await
+        .unwrap();
+
+    let sent = node.sent_messages.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    match HostedMessage::decode(&sent[2].1).unwrap() {
+        HostedMessage::StateOverride(msg) => {
+            assert_eq!(msg.local_balance_msat, latest_override.local_balance_msat);
+            assert_eq!(msg.local_sig_of_remote, latest_override.local_sig_of_remote);
+            assert_ne!(msg.local_sig_of_remote, first_override.local_sig_of_remote);
+        }
+        other => panic!("expected state_override, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1882,11 +2442,12 @@ async fn test_set_channel_rejects_updates_with_pending_htlcs() {
                 fee_base_msat: Some(2_000),
                 ..SetChannelParams::default()
             },
+            false,
         )
         .await
         .is_err());
     assert!(controller
-        .set_channel(&client_public, SetChannelParams::default())
+        .set_channel(&client_public, SetChannelParams::default(), false)
         .await
         .is_ok());
 }

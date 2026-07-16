@@ -210,17 +210,14 @@ Routing-only updates:
 LCSS-affecting updates:
 
 - Affect `channel_capacity_msat`, `initial_client_balance_msat`, `htlc_minimum_msat`, or `maxhtlcs`.
-- Build a new proposed LCSS with updated `init_hosted_channel` and balances.
-- Persist `proposed_override = Some(override_lcss)` and `channel_update_pending = true`.
-- Send `state_override` immediately if possible.
-- If the peer is offline, the existing reconnect/override path resends `state_override` on next hosted-channel invoke/reconnect.
-- After peer accepts the override with `state_update`, the controller persists the new LCSS, clears `proposed_override`, sends or flushes the pending channel_update, and clears `channel_update_pending` after successful send.
+- Are rejected by `canopusd-setchannel` for active channels. cliche/immortan only records incoming `state_override` proposals after the hosted channel is already errored, so active administrative overrides are not interoperable.
+- With explicit `force=true` or `--force`, `canopusd-setchannel` first persists a local error and `proposed_override`, then sends hosted `error` followed by `state_override`. The channel status becomes `Overriding`; reconnect replays LCSS, local error, and the proposal if the peer was offline.
+- If the channel is already `Overriding`, `canopusd-setchannel` updates `ChannelData.proposed_override` without requiring force and sends the latest `state_override` again. Reconnect must only replay the last persisted proposal.
+- Use `canopusd-reset` on an errored/overriding channel for state-override recovery.
 
 Balance semantics for setchannel and reset:
 
 - In host-side LCSS, `local_balance_msat` is host balance and `remote_balance_msat` is client balance.
-- When setting `initial_client_balance_msat` through setchannel, the proposed override uses it as the new client/remote balance.
-- Host/local balance becomes `channel_capacity_msat - remote_balance_msat`.
 - `canopusd-reset peerid new_local_balance_msat` is different: it takes host/local balance and computes client/remote balance as `capacity - new_local_balance_msat`.
 
 Keep `canopusd-reset` as a separate emergency recovery command. It only works in `Errored` or `Overriding` status and clears HTLCs as part of reset. `canopusd-setchannel` is an administrative configuration command for healthy active channels and rejects in-flight HTLCs.
@@ -240,7 +237,6 @@ Channel updates are currently sent:
 - after accepted `state_override`;
 - after wire-level hosted `resize_channel` acceptance;
 - after successful routing-only `canopusd-setchannel` updates;
-- after accepted setchannel-created override;
 - on active hosted reconnect or CLN connect when `channel_update_pending` is true.
 
 If sending a channel_update fails, leave `channel_update_pending = true`. Do not clear it before a successful send.
@@ -426,7 +422,7 @@ Wire `resize_channel` behavior:
 - Updates routing `htlc_maximum_msat` to the new capacity.
 - Persists, sends `state_update`, records a resize ledger event, and sends/pends channel_update.
 
-Admin setchannel LCSS changes use `state_override`, not the wire resize message.
+Admin setchannel rejects LCSS-backed changes for active channels unless explicitly forced with `force=true` or `--force`. Forced setchannel changes deliberately put the channel in errored/overriding state before proposing `state_override`. Use `canopusd-reset` for ordinary errored-channel state override recovery, or the wire-level resize flow for client-driven hosted capacity changes.
 
 Override/reset behavior:
 
@@ -535,7 +531,7 @@ No `TODO` or `stub` markers are expected in `src/` unless deliberately introduce
 ## Common Pitfalls
 
 - Do not use global `effective_policy()` for existing hosted-channel fee checks unless the code is explicitly about global defaults. Existing channel routing uses `ChannelData.routing_policy`.
-- Do not mutate LCSS-backed fields silently. Use state_override-style flow for existing active channels.
+- Do not mutate LCSS-backed fields silently. Active `canopusd-setchannel` LCSS changes are rejected unless explicitly forced; forced changes must persist/send local error before `state_override` because cliche/immortan only accepts override proposals after an error.
 - Do not clear `channel_update_pending` before a channel_update send succeeds.
 - Do not treat `htlc_minimum_msat` as a routing-only field. It is signed in LCSS.
 - Do not treat `htlc_maximum_msat` as signed LCSS. It is advertised routing policy.

@@ -17,8 +17,6 @@ use crate::node::{HtlcResolution, NodeActions, NodeError, NodeInfo, NodeResult, 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FirstHop {
     id: PublicKey,
-    channel: String,
-    direction: u32,
 }
 
 #[derive(Clone)]
@@ -90,24 +88,80 @@ fn first_hop_from_listchannels(
             .get("destination")
             .and_then(|v| v.as_str())
             .ok_or_else(|| NodeError::Rpc("listchannels entry missing destination".into()))?;
-        let direction = channel
-            .get("direction")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| NodeError::Rpc("listchannels entry missing direction".into()))?;
-        let direction = u32::try_from(direction)
-            .map_err(|_| NodeError::Rpc("listchannels direction exceeds u32".into()))?;
         let id = PublicKey::from_str(destination).map_err(|e| NodeError::Rpc(e.to_string()))?;
-        return Ok(FirstHop {
-            id,
-            channel: format_short_channel_id(scid),
-            direction,
-        });
+        return Ok(FirstHop { id });
     }
 
     Err(NodeError::NotFound(format!(
         "active outgoing channel for scid {}",
         format_short_channel_id(scid)
     )))
+}
+
+fn payment_status_from_listsendpays_response(
+    label: &str,
+    response: &Value,
+) -> NodeResult<PaymentStatus> {
+    let Some(pays) = response.get("payments").and_then(|v| v.as_array()) else {
+        return Ok(PaymentStatus::Unknown);
+    };
+    for payment in pays {
+        if payment.get("label").and_then(|v| v.as_str()) != Some(label) {
+            continue;
+        }
+        match payment.get("status").and_then(|v| v.as_str()) {
+            Some("complete") => {
+                let preimage_hex = payment
+                    .get("payment_preimage")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| NodeError::Rpc("complete sendpay missing preimage".into()))?;
+                let bytes = hex::decode(preimage_hex).map_err(|e| NodeError::Rpc(e.to_string()))?;
+                let preimage: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| NodeError::Rpc("preimage is not 32 bytes".into()))?;
+                return Ok(PaymentStatus::Succeeded { preimage });
+            }
+            Some("failed") => {
+                let onion = payment
+                    .get("erroronion")
+                    .or_else(|| payment.get("onionreply"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let bytes = hex::decode(onion).unwrap_or_default();
+                return Ok(PaymentStatus::Failed {
+                    failure_onion: Bytes::from(bytes),
+                });
+            }
+            Some("pending") => return Ok(PaymentStatus::Pending),
+            _ => {}
+        }
+    }
+    Ok(PaymentStatus::Unknown)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sendonion_params(
+    first_hop: &FirstHop,
+    onion: &[u8],
+    payment_hash: [u8; 32],
+    first_amount_msat: u64,
+    first_delay: u16,
+    label: String,
+    group_id: u64,
+    part_id: u64,
+) -> Value {
+    json!({
+        "onion": hex::encode(onion),
+        "payment_hash": hex::encode(payment_hash),
+        "label": label,
+        "groupid": group_id,
+        "partid": part_id,
+        "first_hop": {
+            "id": first_hop.id.to_string(),
+            "amount_msat": format!("{first_amount_msat}msat"),
+            "delay": first_delay,
+        }
+    })
 }
 
 #[async_trait]
@@ -138,62 +192,33 @@ impl NodeActions for ClnNode {
         let first_hop = self.first_hop_for_scid(first_scid).await?;
         self.call(
             "sendonion",
-            json!({
-                "onion": hex::encode(onion),
-                "payment_hash": hex::encode(payment_hash),
-                "label": label,
-                "groupid": group_id,
-                "partid": part_id,
-                "first_hop": {
-                    "id": first_hop.id.to_string(),
-                    "channel": first_hop.channel,
-                    "direction": first_hop.direction,
-                    "amount_msat": format!("{first_amount_msat}msat"),
-                    "delay": first_delay,
-                    "style": "tlv",
-                }
-            }),
+            sendonion_params(
+                &first_hop,
+                &onion,
+                payment_hash,
+                first_amount_msat,
+                first_delay,
+                label,
+                group_id,
+                part_id,
+            ),
         )
         .await?;
         Ok(())
     }
 
-    async fn inspect_outgoing_payment(&self, label: &str) -> NodeResult<PaymentStatus> {
-        let response = self.call("listsendpays", json!({ "label": label })).await?;
-        let Some(pays) = response.get("payments").and_then(|v| v.as_array()) else {
-            return Ok(PaymentStatus::Pending);
-        };
-        for payment in pays {
-            match payment.get("status").and_then(|v| v.as_str()) {
-                Some("complete") => {
-                    let preimage_hex = payment
-                        .get("payment_preimage")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            NodeError::Rpc("complete sendpay missing preimage".into())
-                        })?;
-                    let bytes =
-                        hex::decode(preimage_hex).map_err(|e| NodeError::Rpc(e.to_string()))?;
-                    let preimage: [u8; 32] = bytes
-                        .try_into()
-                        .map_err(|_| NodeError::Rpc("preimage is not 32 bytes".into()))?;
-                    return Ok(PaymentStatus::Succeeded { preimage });
-                }
-                Some("failed") => {
-                    let onion = payment
-                        .get("erroronion")
-                        .or_else(|| payment.get("onionreply"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let bytes = hex::decode(onion).unwrap_or_default();
-                    return Ok(PaymentStatus::Failed {
-                        failure_onion: Bytes::from(bytes),
-                    });
-                }
-                _ => {}
-            }
-        }
-        Ok(PaymentStatus::Pending)
+    async fn inspect_outgoing_payment(
+        &self,
+        payment_hash: &[u8; 32],
+        label: &str,
+    ) -> NodeResult<PaymentStatus> {
+        let response = self
+            .call(
+                "listsendpays",
+                json!({ "payment_hash": hex::encode(payment_hash) }),
+            )
+            .await?;
+        payment_status_from_listsendpays_response(label, &response)
     }
 
     async fn get_block_height(&self) -> NodeResult<u32> {
@@ -349,7 +374,74 @@ mod tests {
 
         let first_hop = first_hop_from_listchannels(&node, scid, &response).unwrap();
         assert_eq!(first_hop.id, peer);
-        assert_eq!(first_hop.channel, "5061345x3x1");
-        assert_eq!(first_hop.direction, 1);
+    }
+
+    #[test]
+    fn sendonion_params_do_not_pin_first_hop_channel() {
+        let peer = pubkey(2);
+        let params = sendonion_params(
+            &FirstHop { id: peer },
+            &[1, 2, 3],
+            [4; 32],
+            1000,
+            40,
+            "label".to_string(),
+            5,
+            6,
+        );
+
+        let first_hop = params.get("first_hop").unwrap();
+        let peer_string = peer.to_string();
+        assert_eq!(
+            first_hop.get("id").and_then(|v| v.as_str()),
+            Some(peer_string.as_str())
+        );
+        assert_eq!(
+            first_hop.get("amount_msat").and_then(|v| v.as_str()),
+            Some("1000msat")
+        );
+        assert_eq!(first_hop.get("delay").and_then(|v| v.as_u64()), Some(40));
+        assert!(first_hop.get("channel").is_none());
+        assert!(first_hop.get("direction").is_none());
+    }
+
+    #[test]
+    fn listsendpays_status_filters_by_label() {
+        let response = json!({
+            "payments": [
+                {
+                    "label": "1/1",
+                    "status": "complete",
+                    "payment_preimage": "1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                {
+                    "label": "2/2",
+                    "status": "pending"
+                }
+            ]
+        });
+
+        match payment_status_from_listsendpays_response("2/2", &response).unwrap() {
+            PaymentStatus::Pending => {}
+            other => panic!("unexpected payment status: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listsendpays_status_unknown_without_matching_label() {
+        let response = json!({
+            "payments": [
+                {
+                    "label": "1/1",
+                    "status": "complete",
+                    "payment_preimage": "1111111111111111111111111111111111111111111111111111111111111111"
+                }
+            ]
+        });
+
+        match payment_status_from_listsendpays_response("2/2", &response).unwrap() {
+            PaymentStatus::Unknown => {}
+            other => panic!("unexpected payment status: {other:?}"),
+        }
     }
 }

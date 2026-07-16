@@ -22,12 +22,12 @@ use crate::wire::codecs::UpdateAddHtlc;
 use crate::wire::lcss::{InitHostedChannel, LastCrossSignedState};
 use crate::wire::{
     AskBrandingInfo, HcError, HostedChannelBranding, HostedMessage, InvokeHostedChannel,
-    StateOverride, StateUpdate, WireEncoding,
+    QueryPreimages, StateOverride, StateUpdate, WireEncoding,
 };
 use bytes::Bytes;
 use secp256k1::{PublicKey, SecretKey};
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -170,6 +170,57 @@ pub fn derive_status(data: &ChannelData) -> Status {
     Status::Active
 }
 
+fn has_uncommitted_local_resolution(data: &ChannelData, htlc_id: u64) -> bool {
+    data.uncommitted.iter().any(|update| {
+        matches!(
+            update,
+            crate::store::UncommittedUpdate::Local(PendingUpdate::Fulfill { id, .. })
+                | crate::store::UncommittedUpdate::Local(PendingUpdate::Fail { id, .. })
+                | crate::store::UncommittedUpdate::Local(PendingUpdate::FailMalformed { id, .. })
+                if *id == htlc_id
+        )
+    })
+}
+
+fn has_uncommitted_remote_resolution(data: &ChannelData, htlc_id: u64) -> bool {
+    data.uncommitted.iter().any(|update| {
+        matches!(
+            update,
+            crate::store::UncommittedUpdate::Remote(PendingUpdate::Fulfill { id, .. })
+                | crate::store::UncommittedUpdate::Remote(PendingUpdate::Fail { id, .. })
+                | crate::store::UncommittedUpdate::Remote(PendingUpdate::FailMalformed { id, .. })
+                if *id == htlc_id
+        )
+    })
+}
+
+fn resolution_key(update: &crate::store::UncommittedUpdate) -> Option<(bool, u64)> {
+    match update {
+        crate::store::UncommittedUpdate::Local(
+            PendingUpdate::Fulfill { id, .. }
+            | PendingUpdate::Fail { id, .. }
+            | PendingUpdate::FailMalformed { id, .. },
+        ) => Some((true, *id)),
+        crate::store::UncommittedUpdate::Remote(
+            PendingUpdate::Fulfill { id, .. }
+            | PendingUpdate::Fail { id, .. }
+            | PendingUpdate::FailMalformed { id, .. },
+        ) => Some((false, *id)),
+        _ => None,
+    }
+}
+
+fn deduplicate_uncommitted_resolutions(
+    updates: &[crate::store::UncommittedUpdate],
+) -> Vec<crate::store::UncommittedUpdate> {
+    let mut seen = HashSet::new();
+    updates
+        .iter()
+        .filter(|update| resolution_key(update).is_none_or(|key| seen.insert(key)))
+        .cloned()
+        .collect()
+}
+
 /// The hosted channel controller — owns the store, node, config, and node key.
 pub struct ChannelController {
     pub store: Arc<dyn Store>,
@@ -282,6 +333,25 @@ impl ChannelController {
             }
         }
         Ok(())
+    }
+
+    async fn repair_duplicate_uncommitted_resolutions(
+        &self,
+        peer_id: &PublicKey,
+        mut data: ChannelData,
+    ) -> ChannelResult<ChannelData> {
+        let deduplicated = deduplicate_uncommitted_resolutions(&data.uncommitted);
+        if deduplicated.len() != data.uncommitted.len() {
+            warn!(
+                %peer_id,
+                before = data.uncommitted.len(),
+                after = deduplicated.len(),
+                "deduplicating repeated uncommitted HTLC resolutions"
+            );
+            data.uncommitted = deduplicated;
+            self.save_channel(peer_id, &data, None).await?;
+        }
+        Ok(data)
     }
 
     /// Get the current block day (block height / 144).
@@ -502,6 +572,9 @@ impl ChannelController {
         peer_id: &PublicKey,
         data: ChannelData,
     ) -> ChannelResult<()> {
+        let data = self
+            .repair_duplicate_uncommitted_resolutions(peer_id, data)
+            .await?;
         // Extract uncommitted local updates for replay
         let uncommitted_local: Vec<_> = data
             .uncommitted
@@ -605,6 +678,9 @@ impl ChannelController {
         }
 
         self.send_pending_channel_update(peer_id).await?;
+        if let Err(err) = self.recover_channel_htlcs(peer_id, true).await {
+            warn!(%peer_id, error_message = %err, "failed to recover committed hosted HTLCs on reconnect");
+        }
 
         Ok(())
     }
@@ -779,6 +855,9 @@ impl ChannelController {
         data: ChannelData,
         msg: StateUpdate,
     ) -> ChannelResult<()> {
+        let data = self
+            .repair_duplicate_uncommitted_resolutions(peer_id, data)
+            .await?;
         if data.uncommitted.is_empty() {
             debug!("ignoring active state_update with no pending transition");
             return Ok(());
@@ -861,7 +940,7 @@ impl ChannelController {
             .await?;
 
         // Dispatch committed side effects (relay HTLCs, etc.)
-        self.dispatch_committed_effects(peer_id, &data, &data.uncommitted, &next)
+        self.dispatch_committed_effects(peer_id, &data, &new_data, &data.uncommitted)
             .await?;
 
         Ok(())
@@ -1040,6 +1119,20 @@ impl ChannelController {
             return Ok(());
         }
 
+        if has_uncommitted_remote_resolution(&data, msg.id) {
+            debug!(%peer_id, htlc_id = msg.id, "ignoring duplicate remote malformed fail");
+            return Ok(());
+        }
+        if !data
+            .lcss
+            .outgoing_htlcs
+            .iter()
+            .any(|h| h.htlc_id() == msg.id)
+        {
+            debug!(%peer_id, htlc_id = msg.id, "ignoring remote malformed fail for unknown HTLC");
+            return Ok(());
+        }
+
         let mut new_data = data.clone();
         new_data
             .uncommitted
@@ -1069,6 +1162,11 @@ impl ChannelController {
 
         let status = derive_status(&data);
         if status != Status::Active && status != Status::Errored {
+            return Ok(());
+        }
+
+        if has_uncommitted_remote_resolution(&data, msg.id) {
+            debug!(%peer_id, htlc_id = msg.id, "ignoring duplicate remote fulfill");
             return Ok(());
         }
 
@@ -1132,6 +1230,20 @@ impl ChannelController {
 
         let status = derive_status(&data);
         if status != Status::Active && status != Status::Errored {
+            return Ok(());
+        }
+
+        if has_uncommitted_remote_resolution(&data, msg.id) {
+            debug!(%peer_id, htlc_id = msg.id, "ignoring duplicate remote fail");
+            return Ok(());
+        }
+        if !data
+            .lcss
+            .outgoing_htlcs
+            .iter()
+            .any(|h| h.htlc_id() == msg.id)
+        {
+            debug!(%peer_id, htlc_id = msg.id, "ignoring remote fail for unknown HTLC");
             return Ok(());
         }
 
@@ -1310,6 +1422,7 @@ impl ChannelController {
         &self,
         peer_id: &PublicKey,
         params: SetChannelParams,
+        force_lcss_override: bool,
     ) -> ChannelResult<(ChannelParameters, bool)> {
         let data = self
             .load_channel(peer_id)
@@ -1319,17 +1432,24 @@ impl ChannelController {
             return Ok((self.channel_parameters_for_data(&data).await?, false));
         }
 
-        if derive_status(&data) != Status::Active {
+        let status = derive_status(&data);
+        if status != Status::Active && status != Status::Overriding {
             return Err(ChannelError::InvalidMessage(
-                "can only update active channels".into(),
+                "can only update active or overriding channels".into(),
             ));
         }
-        if !data.lcss.incoming_htlcs.is_empty()
-            || !data.lcss.outgoing_htlcs.is_empty()
-            || !data.uncommitted.is_empty()
+        if status == Status::Active
+            && (!data.lcss.incoming_htlcs.is_empty()
+                || !data.lcss.outgoing_htlcs.is_empty()
+                || !data.uncommitted.is_empty())
         {
             return Err(ChannelError::InvalidMessage(
                 "cannot update channel with in-flight HTLCs".into(),
+            ));
+        }
+        if status == Status::Active && params.affects_lcss() && !force_lcss_override {
+            return Err(ChannelError::InvalidMessage(
+                "LCSS-backed channel changes require an errored channel reset; active peers ignore state_override proposals".into(),
             ));
         }
 
@@ -1351,8 +1471,17 @@ impl ChannelController {
         new_data.routing_policy = Some(routing.clone());
         new_data.channel_update_pending = true;
 
-        if params.affects_lcss() {
-            let mut init = data.lcss.init_hosted_channel.clone();
+        if params.affects_lcss() || status == Status::Overriding {
+            let base_lcss = if status == Status::Overriding {
+                data.proposed_override
+                    .as_ref()
+                    .ok_or(ChannelError::InvalidMessage(
+                        "overriding channel has no proposed override".into(),
+                    ))?
+            } else {
+                &data.lcss
+            };
+            let mut init = base_lcss.init_hosted_channel.clone();
             if let Some(v) = params.channel_capacity_msat {
                 init.channel_capacity_msat = v;
                 init.max_htlc_value_in_flight_msat = v;
@@ -1374,7 +1503,7 @@ impl ChannelController {
 
             let remote_balance = params
                 .initial_client_balance_msat
-                .unwrap_or(data.lcss.remote_balance_msat);
+                .unwrap_or(base_lcss.remote_balance_msat);
             let local_balance = init
                 .channel_capacity_msat
                 .checked_sub(remote_balance)
@@ -1407,9 +1536,23 @@ impl ChannelController {
                 local_sig_of_remote: [0; 64],
             };
             override_lcss.sign(&self.node_secret)?;
+            if new_data.local_errors.is_empty() {
+                new_data
+                    .local_errors
+                    .push("forced channel parameter override".to_string());
+            }
             new_data.proposed_override = Some(override_lcss.clone());
             self.save_channel(peer_id, &new_data, None).await?;
-            if let Err(err) = self
+
+            let err = HcError {
+                channel_id: channel_id(&self.node_public, peer_id),
+                data: Bytes::copy_from_slice(new_data.local_errors[0].as_bytes()),
+                tlv_stream: Bytes::new(),
+            };
+            if let Err(send_err) = self.send_message(peer_id, HostedMessage::Error(err)).await {
+                warn!(%peer_id, error_message = %send_err, "failed to send forced setchannel error");
+            }
+            if let Err(send_err) = self
                 .send_message(
                     peer_id,
                     HostedMessage::StateOverride(StateOverride {
@@ -1422,23 +1565,29 @@ impl ChannelController {
                 )
                 .await
             {
-                warn!(%peer_id, error_message = %err, "failed to send pending setchannel state_override");
+                warn!(%peer_id, error_message = %send_err, "failed to send forced setchannel state_override");
             }
-        } else {
-            if routing.htlc_maximum_msat > data.lcss.init_hosted_channel.channel_capacity_msat {
-                return Err(ChannelError::InvalidMessage(
-                    "htlc_maximum_msat exceeds channel_capacity_msat".into(),
-                ));
-            }
-            if data.lcss.init_hosted_channel.htlc_minimum_msat > routing.htlc_maximum_msat {
-                return Err(ChannelError::InvalidMessage(
-                    "htlc_minimum_msat exceeds htlc_maximum_msat".into(),
-                ));
-            }
-            self.save_channel(peer_id, &new_data, None).await?;
-            if let Err(err) = self.send_pending_channel_update(peer_id).await {
-                warn!(%peer_id, error_message = %err, "failed to send pending setchannel channel_update");
-            }
+
+            let data = self
+                .load_channel(peer_id)
+                .await?
+                .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+            return Ok((self.channel_parameters_for_data(&data).await?, true));
+        }
+
+        if routing.htlc_maximum_msat > data.lcss.init_hosted_channel.channel_capacity_msat {
+            return Err(ChannelError::InvalidMessage(
+                "htlc_maximum_msat exceeds channel_capacity_msat".into(),
+            ));
+        }
+        if data.lcss.init_hosted_channel.htlc_minimum_msat > routing.htlc_maximum_msat {
+            return Err(ChannelError::InvalidMessage(
+                "htlc_minimum_msat exceeds htlc_maximum_msat".into(),
+            ));
+        }
+        self.save_channel(peer_id, &new_data, None).await?;
+        if let Err(err) = self.send_pending_channel_update(peer_id).await {
+            warn!(%peer_id, error_message = %err, "failed to send pending setchannel channel_update");
         }
 
         let data = self
@@ -1607,10 +1756,23 @@ impl ChannelController {
 
         // Persist the proposed override
         let mut new_data = data.clone();
+        if new_data.local_errors.is_empty() {
+            new_data
+                .local_errors
+                .push("host proposed state override".to_string());
+        }
         new_data.proposed_override = Some(override_lcss.clone());
         self.save_channel(peer_id, &new_data, None).await?;
 
-        // Send state_override
+        let err = HcError {
+            channel_id: channel_id(&self.node_public, peer_id),
+            data: Bytes::copy_from_slice(new_data.local_errors[0].as_bytes()),
+            tlv_stream: Bytes::new(),
+        };
+        self.send_message(peer_id, HostedMessage::Error(err))
+            .await?;
+
+        // cliche records state_override proposals only after the hosted channel is errored.
         self.send_message(
             peer_id,
             HostedMessage::StateOverride(StateOverride {
@@ -1838,16 +2000,122 @@ impl ChannelController {
         Ok(())
     }
 
+    pub async fn recover_committed_htlcs(&self) -> ChannelResult<()> {
+        for peer_id in self.list_channels().await? {
+            if let Err(err) = self.recover_channel_htlcs(&peer_id, false).await {
+                warn!(%peer_id, error_message = %err, "failed to recover committed hosted HTLCs");
+            }
+        }
+        Ok(())
+    }
+
+    async fn recover_channel_htlcs(
+        &self,
+        peer_id: &PublicKey,
+        query_outgoing: bool,
+    ) -> ChannelResult<()> {
+        let Some(data) = self.load_channel(peer_id).await? else {
+            return Ok(());
+        };
+        if derive_status(&data) != Status::Active {
+            return Ok(());
+        }
+
+        let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id);
+        for htlc in &data.lcss.incoming_htlcs {
+            if has_uncommitted_local_resolution(&data, htlc.htlc_id()) {
+                continue;
+            }
+            if let Some(link) = self
+                .forward_link_for_incoming(hosted_scid, htlc.htlc_id())
+                .await?
+            {
+                if self
+                    .peer_for_hosted_scid(link.outgoing_scid)
+                    .await?
+                    .is_some()
+                {
+                    continue;
+                }
+                let label = format!("{}/{}", link.outgoing_scid, link.outgoing_htlc_id);
+                match self
+                    .node
+                    .inspect_outgoing_payment(&link.payment_hash, &label)
+                    .await?
+                {
+                    PaymentStatus::Succeeded { preimage } => {
+                        self.handle_outgoing_payment_result(
+                            link.outgoing_scid,
+                            link.outgoing_htlc_id,
+                            PaymentStatus::Succeeded { preimage },
+                        )
+                        .await?;
+                    }
+                    PaymentStatus::Failed { failure_onion } => {
+                        self.handle_outgoing_payment_result(
+                            link.outgoing_scid,
+                            link.outgoing_htlc_id,
+                            PaymentStatus::Failed { failure_onion },
+                        )
+                        .await?;
+                    }
+                    PaymentStatus::Pending => {}
+                    PaymentStatus::Unknown => {
+                        self.dispatch_committed_incoming_htlc(peer_id, &data, htlc)
+                            .await?;
+                    }
+                }
+            } else {
+                self.dispatch_committed_incoming_htlc(peer_id, &data, htlc)
+                    .await?;
+            }
+        }
+
+        if query_outgoing {
+            self.recover_outgoing_htlcs(peer_id, &data).await?;
+        }
+        Ok(())
+    }
+
+    async fn recover_outgoing_htlcs(
+        &self,
+        peer_id: &PublicKey,
+        data: &ChannelData,
+    ) -> ChannelResult<()> {
+        let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id);
+        let mut hashes = Vec::new();
+        for htlc in &data.lcss.outgoing_htlcs {
+            if has_uncommitted_remote_resolution(data, htlc.htlc_id()) {
+                continue;
+            }
+            if let Some(preimage) = self.node.lookup_preimage(&htlc.payment_hash).await? {
+                self.resolve_forward_fulfill(hosted_scid, htlc.htlc_id(), preimage)
+                    .await?;
+            } else {
+                hashes.push(htlc.payment_hash);
+            }
+        }
+
+        if !hashes.is_empty() {
+            self.send_message(
+                peer_id,
+                HostedMessage::QueryPreimages(QueryPreimages { hashes }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Dispatch committed side effects (relay HTLCs, etc.).
     async fn dispatch_committed_effects(
         &self,
         peer_id: &PublicKey,
         old_data: &ChannelData,
+        committed_data: &ChannelData,
         committed_updates: &[crate::store::UncommittedUpdate],
-        new_lcss: &LastCrossSignedState,
     ) -> ChannelResult<()> {
         let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id);
-        for htlc in &new_lcss.incoming_htlcs {
+        for htlc in &committed_data.lcss.incoming_htlcs {
             if old_data
                 .lcss
                 .incoming_htlcs
@@ -1856,145 +2124,8 @@ impl ChannelController {
             {
                 continue;
             }
-
-            let policy = &new_lcss.init_hosted_channel;
-            let total_htlcs = new_lcss.incoming_htlcs.len() + new_lcss.outgoing_htlcs.len();
-            let total_inflight = new_lcss
-                .incoming_htlcs
-                .iter()
-                .chain(new_lcss.outgoing_htlcs.iter())
-                .map(|h| h.amount_msat)
-                .sum::<u64>();
-            if htlc.amount_msat < policy.htlc_minimum_msat
-                || total_htlcs > policy.max_accepted_htlcs as usize
-                || total_inflight > policy.max_htlc_value_in_flight_msat
-            {
-                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
-                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
-                    .await?;
-                continue;
-            }
-
-            let peeled = match crate::sphinx::peel_onion(
-                &self.node_secret,
-                &htlc.onion_routing_packet,
-                &htlc.payment_hash,
-            ) {
-                Ok(peeled) => peeled,
-                Err(_) => {
-                    let onion_hash: [u8; 32] =
-                        sha2::Sha256::digest(&htlc.onion_routing_packet).into();
-                    self.send_local_fail_malformed_for_htlc(
-                        peer_id,
-                        htlc.htlc_id(),
-                        onion_hash,
-                        0xc005,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-
-            if htlc.amount_msat < peeled.amt_to_forward {
-                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
-                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
-                    .await?;
-                continue;
-            }
-
-            let outgoing_scid = peeled.short_channel_id;
-            if let Some(target_peer) = self.peer_for_hosted_scid(outgoing_scid).await? {
-                if target_peer == *peer_id {
-                    return Err(ChannelError::InvalidMessage(
-                        "cannot forward hosted HTLC back to same channel".into(),
-                    ));
-                }
-                let target_data = self
-                    .load_channel(&target_peer)
-                    .await?
-                    .ok_or(ChannelError::NotFound(hex::encode(target_peer.serialize())))?;
-                let target_routing = self.routing_policy_for_data(&target_data).await?;
-                let current_height = self.node.get_block_height().await.unwrap_or_default();
-                let required_fee = (peeled.amt_to_forward / 1_000_000)
-                    .saturating_mul(target_routing.fee_proportional_millionths as u64)
-                    .saturating_add(target_routing.fee_base_msat as u64);
-                if peeled.outgoing_cltv_value < current_height.saturating_add(2)
-                    || htlc.amount_msat < peeled.amt_to_forward.saturating_add(required_fee)
-                    || htlc.cltv_expiry
-                        < peeled
-                            .outgoing_cltv_value
-                            .saturating_add(target_routing.cltv_expiry_delta as u32)
-                {
-                    let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
-                    self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
-                        .await?;
-                    continue;
-                }
-                let outgoing_htlc = UpdateAddHtlc {
-                    channel_id: channel_id(&self.node_public, &target_peer),
-                    id: 0,
-                    amount_msat: peeled.amt_to_forward,
-                    payment_hash: htlc.payment_hash,
-                    cltv_expiry: peeled.outgoing_cltv_value,
-                    onion_routing_packet: Bytes::from(peeled.next_onion),
-                    tlv_stream: Bytes::new(),
-                };
-                let result_key = format!("{hosted_scid}/{}", htlc.htlc_id());
-                self.channel_handle_htlc_add(
-                    &target_peer,
-                    outgoing_htlc,
-                    &result_key,
-                    hosted_scid,
-                    htlc.htlc_id(),
-                    Some(peeled.shared_secret),
-                )
+            self.dispatch_committed_incoming_htlc(peer_id, committed_data, htlc)
                 .await?;
-                continue;
-            }
-            let outgoing_htlc_id = htlc.htlc_id();
-            let link = ForwardLink {
-                incoming_scid: hosted_scid,
-                incoming_htlc_id: htlc.htlc_id(),
-                outgoing_scid,
-                outgoing_htlc_id,
-                payment_hash: htlc.payment_hash,
-                shared_secret: Some(peeled.shared_secret),
-            };
-            let key = Self::forward_key(outgoing_scid, outgoing_htlc_id);
-            let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
-            match crate::store::create_json(self.store.as_ref(), &key_ref, &link).await {
-                Ok(()) | Err(StoreError::AlreadyExists(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
-
-            let current_height = self.node.get_block_height().await.unwrap_or_default();
-            let first_delay = peeled
-                .outgoing_cltv_value
-                .saturating_sub(current_height)
-                .saturating_sub(1)
-                .min(u16::MAX as u32) as u16;
-            let label = format!("{outgoing_scid}/{outgoing_htlc_id}");
-            if self
-                .node
-                .send_onion(
-                    Bytes::from(peeled.next_onion),
-                    htlc.payment_hash,
-                    outgoing_scid,
-                    peeled.amt_to_forward,
-                    first_delay,
-                    label,
-                    outgoing_scid / 100,
-                    outgoing_htlc_id,
-                )
-                .await
-                .is_err()
-            {
-                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
-                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
-                    .await?;
-                let _ = self.store.delete(&key_ref).await;
-                continue;
-            }
         }
 
         for update in committed_updates {
@@ -2022,10 +2153,193 @@ impl ChannelController {
         Ok(())
     }
 
+    async fn dispatch_committed_incoming_htlc(
+        &self,
+        peer_id: &PublicKey,
+        committed_data: &ChannelData,
+        htlc: &UpdateAddHtlc,
+    ) -> ChannelResult<()> {
+        let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id);
+        let policy = &committed_data.lcss.init_hosted_channel;
+        let total_htlcs =
+            committed_data.lcss.incoming_htlcs.len() + committed_data.lcss.outgoing_htlcs.len();
+        let total_inflight = committed_data
+            .lcss
+            .incoming_htlcs
+            .iter()
+            .chain(committed_data.lcss.outgoing_htlcs.iter())
+            .map(|h| h.amount_msat)
+            .sum::<u64>();
+        if htlc.amount_msat < policy.htlc_minimum_msat
+            || total_htlcs > policy.max_accepted_htlcs as usize
+            || total_inflight > policy.max_htlc_value_in_flight_msat
+        {
+            let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+            self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                .await?;
+            return Ok(());
+        }
+
+        let peeled = match crate::sphinx::peel_onion(
+            &self.node_secret,
+            &htlc.onion_routing_packet,
+            &htlc.payment_hash,
+        ) {
+            Ok(peeled) => peeled,
+            Err(_) => {
+                let onion_hash: [u8; 32] = sha2::Sha256::digest(&htlc.onion_routing_packet).into();
+                self.send_local_fail_malformed_for_htlc(
+                    peer_id,
+                    htlc.htlc_id(),
+                    onion_hash,
+                    0xc005,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if htlc.amount_msat < peeled.amt_to_forward {
+            let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+            self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                .await?;
+            return Ok(());
+        }
+
+        let outgoing_scid = peeled.short_channel_id;
+        if let Some(target_peer) = self.peer_for_hosted_scid(outgoing_scid).await? {
+            if target_peer == *peer_id {
+                return Err(ChannelError::InvalidMessage(
+                    "cannot forward hosted HTLC back to same channel".into(),
+                ));
+            }
+            let target_data = self
+                .load_channel(&target_peer)
+                .await?
+                .ok_or(ChannelError::NotFound(hex::encode(target_peer.serialize())))?;
+            let target_routing = self.routing_policy_for_data(&target_data).await?;
+            let current_height = self.node.get_block_height().await.unwrap_or_default();
+            let required_fee = (peeled.amt_to_forward / 1_000_000)
+                .saturating_mul(target_routing.fee_proportional_millionths as u64)
+                .saturating_add(target_routing.fee_base_msat as u64);
+            if peeled.outgoing_cltv_value < current_height.saturating_add(2)
+                || htlc.amount_msat < peeled.amt_to_forward.saturating_add(required_fee)
+                || htlc.cltv_expiry
+                    < peeled
+                        .outgoing_cltv_value
+                        .saturating_add(target_routing.cltv_expiry_delta as u32)
+            {
+                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                    .await?;
+                return Ok(());
+            }
+            let outgoing_htlc = UpdateAddHtlc {
+                channel_id: channel_id(&self.node_public, &target_peer),
+                id: 0,
+                amount_msat: peeled.amt_to_forward,
+                payment_hash: htlc.payment_hash,
+                cltv_expiry: peeled.outgoing_cltv_value,
+                onion_routing_packet: Bytes::from(peeled.next_onion),
+                tlv_stream: Bytes::new(),
+            };
+            let result_key = format!("{hosted_scid}/{}", htlc.htlc_id());
+            self.channel_handle_htlc_add(
+                &target_peer,
+                outgoing_htlc,
+                &result_key,
+                hosted_scid,
+                htlc.htlc_id(),
+                Some(peeled.shared_secret),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let outgoing_htlc_id = htlc.htlc_id();
+        let link = ForwardLink {
+            incoming_scid: hosted_scid,
+            incoming_htlc_id: htlc.htlc_id(),
+            outgoing_scid,
+            outgoing_htlc_id,
+            payment_hash: htlc.payment_hash,
+            shared_secret: Some(peeled.shared_secret),
+        };
+        let key = Self::forward_key(outgoing_scid, outgoing_htlc_id);
+        let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
+        match crate::store::create_json(self.store.as_ref(), &key_ref, &link).await {
+            Ok(()) | Err(StoreError::AlreadyExists(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let current_height = self.node.get_block_height().await.unwrap_or_default();
+        let first_delay = peeled
+            .outgoing_cltv_value
+            .saturating_sub(current_height)
+            .saturating_sub(1)
+            .min(u16::MAX as u32) as u16;
+        let label = format!("{outgoing_scid}/{outgoing_htlc_id}");
+        if self
+            .node
+            .send_onion(
+                Bytes::from(peeled.next_onion),
+                htlc.payment_hash,
+                outgoing_scid,
+                peeled.amt_to_forward,
+                first_delay,
+                label,
+                outgoing_scid / 100,
+                outgoing_htlc_id,
+            )
+            .await
+            .is_err()
+        {
+            let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+            self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                .await?;
+            let _ = self.store.delete(&key_ref).await;
+        }
+        Ok(())
+    }
+
     async fn peer_for_hosted_scid(&self, scid: u64) -> ChannelResult<Option<PublicKey>> {
         for peer in self.list_channels().await? {
             if hosted_short_channel_id(&self.node_public, &peer) == scid {
                 return Ok(Some(peer));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn forward_link_for_incoming(
+        &self,
+        incoming_scid: u64,
+        incoming_htlc_id: u64,
+    ) -> ChannelResult<Option<ForwardLink>> {
+        for scid_key in self.store.list(&["canopusd", "htlc_forwards"]).await? {
+            let Some(scid) = scid_key.last() else {
+                continue;
+            };
+            let htlc_keys = self
+                .store
+                .list(&["canopusd", "htlc_forwards", scid])
+                .await?;
+            for key in htlc_keys {
+                let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
+                let (link, _) = match crate::store::get_json::<ForwardLink>(
+                    self.store.as_ref(),
+                    &key_ref,
+                )
+                .await
+                {
+                    Ok(link) => link,
+                    Err(StoreError::NotFound(_)) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if link.incoming_scid == incoming_scid && link.incoming_htlc_id == incoming_htlc_id
+                {
+                    return Ok(Some(link));
+                }
             }
         }
         Ok(None)
@@ -2270,6 +2584,7 @@ impl ChannelController {
                 let _ = self.store.delete(&key_ref).await;
             }
             PaymentStatus::Pending => {}
+            PaymentStatus::Unknown => {}
         }
         Ok(())
     }
@@ -2787,6 +3102,7 @@ impl ChannelController {
         if derive_status(&data) == Status::Active && data.channel_update_pending {
             self.send_pending_channel_update(peer_id).await?;
         }
+        self.recover_channel_htlcs(peer_id, true).await?;
         Ok(())
     }
 

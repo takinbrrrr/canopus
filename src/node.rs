@@ -31,6 +31,8 @@ pub enum PaymentStatus {
     Failed { failure_onion: Bytes },
     /// Payment is still pending.
     Pending,
+    /// No matching outgoing payment record exists.
+    Unknown,
 }
 
 /// Actions the channel logic can request from the host node.
@@ -54,8 +56,12 @@ pub trait NodeActions: Send + Sync {
         part_id: u64,
     ) -> NodeResult<()>;
 
-    /// Look up the result of an outgoing payment by label.
-    async fn inspect_outgoing_payment(&self, label: &str) -> NodeResult<PaymentStatus>;
+    /// Look up the result of an outgoing payment by payment hash and label.
+    async fn inspect_outgoing_payment(
+        &self,
+        payment_hash: &[u8; 32],
+        label: &str,
+    ) -> NodeResult<PaymentStatus>;
 
     /// Get the current block height.
     async fn get_block_height(&self) -> NodeResult<u32>;
@@ -215,10 +221,14 @@ impl NodeActions for MockNode {
         Ok(())
     }
 
-    async fn inspect_outgoing_payment(&self, label: &str) -> NodeResult<PaymentStatus> {
+    async fn inspect_outgoing_payment(
+        &self,
+        _payment_hash: &[u8; 32],
+        label: &str,
+    ) -> NodeResult<PaymentStatus> {
         match self.payment_results.lock().unwrap().get(label) {
             Some(s) => Ok(s.clone()),
-            None => Ok(PaymentStatus::Pending),
+            None => Ok(PaymentStatus::Unknown),
         }
     }
 
