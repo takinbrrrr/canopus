@@ -46,11 +46,11 @@ impl Default for ChannelPolicy {
             channel_capacity_msat: 100_000_000, // 100k sats
             initial_client_balance_msat: 0,
             max_htlc_value_in_flight_msat: 100_000_000, // 100k sats
-            htlc_minimum_msat: 546_000,
+            htlc_minimum_msat: 1_000,
             max_accepted_htlcs: 12,
-            fee_base_msat: 1_000,
+            fee_base_msat: 0,
             fee_proportional_millionths: 1_000,
-            cltv_expiry_delta: 137,
+            cltv_expiry_delta: 6,
         }
     }
 }
@@ -169,7 +169,9 @@ mod tests {
         let config = Config::default();
         assert!(config.require_secret);
         assert_eq!(config.policy.max_htlc_value_in_flight_msat, 100_000_000);
-        assert_eq!(config.policy.htlc_minimum_msat, 546_000);
+        assert_eq!(config.policy.htlc_minimum_msat, 1_000);
+        assert_eq!(config.policy.fee_base_msat, 0);
+        assert_eq!(config.policy.cltv_expiry_delta, 6);
     }
 
     #[test]

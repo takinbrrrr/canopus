@@ -1980,7 +1980,7 @@ async fn test_set_channel_reads_and_updates_routing_policy() {
         .await
         .unwrap();
     assert!(!updated);
-    assert_eq!(current.feebase_msat, 1_000);
+    assert_eq!(current.feebase_msat, 0);
     assert_eq!(current.feeppm, 1_000);
 
     let (current, updated) = controller

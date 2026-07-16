@@ -66,10 +66,10 @@ All options can be set in the CLN config file or on the command line:
 |--------|------|---------|-------------|
 | `canopus-capacity-msat` | int | 100000000 | Default channel capacity in millisatoshi |
 | `canopus-initial-balance-msat` | int | 0 | Default initial client balance |
-| `canopus-fee-base-msat` | int | 1000 | Base fee for forwarding |
+| `canopus-fee-base-msat` | int | 0 | Base fee for forwarding |
 | `canopus-fee-ppm` | int | 1000 | Proportional fee (parts per million) |
-| `canopus-cltv-delta` | int | 137 | CLTV expiry delta |
-| `canopus-htlc-min-msat` | int | 546000 | Minimum HTLC amount |
+| `canopus-cltv-delta` | int | 6 | CLTV expiry delta |
+| `canopus-htlc-min-msat` | int | 1000 | Minimum HTLC amount |
 | `canopus-max-htlcs` | int | 12 | Max accepted HTLCs per channel |
 | `canopus-max-inflight-msat` | int | 100000000 | Max HTLC value in flight |
 
