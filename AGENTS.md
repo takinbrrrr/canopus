@@ -28,9 +28,9 @@ cargo audit
 
 Current expected test shape after the latest work is approximately:
 
-- 127 library unit tests
-- 6 binary unit tests
-- 35 integration tests
+- 131 library unit tests
+- 8 binary unit tests
+- 43 integration tests
 
 The exact count may change, but all tests and clippy must pass before handing off code changes. The sandbox does not provide `lightningd`, `bitcoind`, or a JVM. All normal tests are mock-based with `MemoryStore` and `MockNode`. Live cliche/immortan/poncho/CLN interop requires an external regtest environment.
 
@@ -94,6 +94,8 @@ The plugin can start locked if the CLN `hsm_secret` requires a passphrase. While
 
 All canopus RPC handlers either take no args or support named arguments.
 
+CLN plugin RPC methods are not interactive. A handler receives a single JSON-RPC request and returns one result or error; it cannot safely prompt because plugin stdin/stdout are reserved for the CLN plugin protocol. Require values as parameters, use explicit confirmation flags such as `force=true`, prefer `*_file` parameters for sensitive input, or split operations into prepare/confirm RPCs.
+
 The helper behavior in `main.rs` is:
 
 - `param(request, key)` checks a top-level key and `params.key`.
@@ -138,6 +140,8 @@ Important keys:
 - `canopus/ledger/<seq>` -> ledger event
 - `canopus/meta` -> ledger sequence metadata
 
+Datastore deletion is exact-key only. `Store::list(prefix)` returns immediate child keys, not every descendant, so subtree cleanup must recursively walk children and delete leaves before deleting the root. Prefer CLN `listdatastore`/`deldatastore` or the `Store` abstraction over direct DB edits. If direct SQLite cleanup is unavoidable, stop `lightningd`, back up the database, and remember CLN encodes datastore keys as NUL-separated BLOB parts: `canopus` is hex `63616E6F707573`, descendants start with `63616E6F70757300`; the old pre-rename `canopusd` root is `63616E6F70757364`, descendants start with `63616E6F7075736400`.
+
 `ChannelData` contains:
 
 - `lcss`: the committed cross-signed hosted state.
@@ -164,6 +168,18 @@ Global policy:
 - Loaded by `effective_policy()`; falls back to startup config/defaults if not persisted.
 - Used for new channel creation and secret-derived effective policy.
 - Updating it does not mutate existing channels.
+
+Default startup policy for new channels:
+
+- `channel_capacity_msat = 100_000_000`
+- `initial_client_balance_msat = 0`
+- `max_htlc_value_in_flight_msat = 100_000_000`
+- `htlc_minimum_msat = 1_000`
+- `max_accepted_htlcs = 12`
+- `fee_base_msat = 0`
+- `fee_proportional_millionths = 1_000`
+- `cltv_expiry_delta = 6`
+- `htlc_maximum_msat` is derived from channel capacity for new routing policy.
 
 Per-channel state and routing policy:
 
@@ -282,6 +298,12 @@ Active reconnect sends the stored LCSS, replays uncommitted local updates exactl
 
 Errored/overriding reconnect sends the stored LCSS, sends a local error if present, and resends `state_override` if `proposed_override` exists.
 
+Committed HTLC recovery is best-effort and runs after startup/unlock plus per-channel on active hosted reconnect and CLN peer connect. Recovery must not fail `custommsg` hook handling.
+
+Committed incoming hosted HTLCs are redriven from stored `ForwardLink` state: success/failure is resolved when known, pending work is left alone, and missing/unknown downstream work is redriven.
+
+Committed outgoing hosted HTLCs must not be replayed as duplicate `update_add_htlc` messages on reconnect. If a preimage is known, resolve with `update_fulfill_htlc`; otherwise send `query_preimages` for the committed outgoing payment hashes.
+
 Pending channel updates are durable via `channel_update_pending`. Active reconnect and CLN connect attempt to flush them. This is required so routing-only `canopus-setchannel` changes made while a client is offline are delivered on next connection.
 
 The disconnect handler clears legacy session wire encoding. It otherwise relies on persisted state and reconnect reconciliation.
@@ -335,6 +357,7 @@ For hosted-origin to real-LN forwarding:
 - canopus still persists a `ForwardLink` before calling `sendonion`.
 - The `sendonion` label is `<outgoing_scid>/<outgoing_htlc_id>`.
 - `group_id` is `outgoing_scid / 100`; `part_id` is the outgoing HTLC id.
+- `sendonion` first-hop params must not pin `first_hop.channel` or `direction`; let CLN resolve the actual outgoing channel from gossip/listchannels.
 
 For hosted-origin to hosted-destination forwarding:
 
@@ -395,7 +418,10 @@ Downstream real-LN sendpay failure:
 
 - Look up `ForwardLink` by label/scid/id.
 - Wrap the failure onion for the hosted source if a shared secret exists.
+- Use `onionreply`/`erroronion` when present; otherwise fall back to a two-byte `failcode` payload.
 - Send failure upstream and delete the forward link.
+
+Outgoing payment inspection uses `listsendpays { payment_hash }` and filters labels locally. `PaymentStatus::Unknown` means no matching labeled payment result was found and should generally be treated as no-op/pending, not as a failure.
 
 Downstream fulfill:
 
@@ -539,6 +565,9 @@ No `TODO` or `stub` markers are expected in `src/` unless deliberately introduce
 - Do not fail hosted-origin HTLCs before commit when the failure is a side effect of a committed add. Commit-then-fail is intentional.
 - Do not delete forward links before upstream resolution is safely persisted/sent.
 - Do not replay remote errors as local errors on reconnect.
+- Do not replay committed outgoing hosted HTLCs as fresh `update_add_htlc` messages on reconnect; use known preimages or `query_preimages`.
+- Do not allow repeated remote fulfill/fail/fail_malformed updates to accumulate duplicate uncommitted resolutions. Duplicate remote resolutions are idempotent and should be deduplicated before state folding/reconnect replay.
+- Do not let hosted `custommsg` processing errors escape as plugin JSON-RPC errors; log channel errors and return hook `continue` unless the hook payload itself is malformed enough to ignore.
 - Do not collapse strict and legacy framing behavior.
 - Do not modify sighash or endian details without comparing against scoin/poncho.
 - Do not introduce persistence schema fields without serde defaults or migration handling for existing CLN datastore entries.
