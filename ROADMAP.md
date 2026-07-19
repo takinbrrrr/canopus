@@ -21,15 +21,10 @@ This file tracks production validation, hardening, and future compatibility work
 
 ## Missing Features
 
-- Hosted channel removal:
-  - Add an operator RPC to remove or archive hosted channels.
-  - Define safety rules for active channels, pending HTLCs, ledger retention, and datastore cleanup.
-  - Decide whether removal means suspend, soft-delete/archive, or full datastore deletion.
-  - Expected implementation areas: `src/channel.rs`, `src/main.rs`, `src/store.rs`, `src/ledger.rs`, and operator docs.
 - Poncho/scoin extension messages not currently implemented:
   - `announcement_signature`
   - public hosted channel query/reply
-  - PHC gossip/sync messages
+  - inbound PHC channel-update/gossip handling
 
 ## Reliability
 
