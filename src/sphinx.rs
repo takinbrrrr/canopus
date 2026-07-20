@@ -471,10 +471,21 @@ fn build_payload(
         final_payload.extend_from_slice(&short_channel_id.to_be_bytes());
     }
     if let Some(secret) = payment_secret {
+        let amount_bytes = amount_msat.to_be_bytes();
+        let amount_bytes = if amount_msat == 0 {
+            &amount_bytes[amount_bytes.len()..]
+        } else {
+            let first_non_zero = amount_bytes
+                .iter()
+                .position(|byte| *byte != 0)
+                .expect("non-zero amount has a non-zero byte");
+            &amount_bytes[first_non_zero..]
+        };
         write_bigsize(&mut final_payload, 8);
-        write_bigsize(&mut final_payload, 40);
+        write_bigsize(&mut final_payload, 33 + amount_bytes.len() as u64);
         final_payload.extend_from_slice(&secret);
-        final_payload.extend_from_slice(&amount_msat.to_be_bytes());
+        final_payload.extend_from_slice(&[amount_bytes.len() as u8]);
+        final_payload.extend_from_slice(amount_bytes);
     }
 
     final_payload
@@ -675,6 +686,15 @@ mod tests {
         assert_eq!(peeled.amt_to_forward, 123_456);
         assert_eq!(peeled.outgoing_cltv_value, 700_123);
         assert!(peeled.next_onion.is_empty());
+    }
+
+    #[test]
+    fn payment_data_uses_truncated_total_amount() {
+        let payload = build_payload(50_000, 1, None, Some([3; 32]));
+        let mut expected = vec![2, 2, 0xc3, 0x50, 4, 1, 1, 8, 0x23];
+        expected.extend_from_slice(&[3; 32]);
+        expected.extend_from_slice(&[2, 0xc3, 0x50]);
+        assert_eq!(payload.as_ref(), expected.as_slice());
     }
 
     #[test]
