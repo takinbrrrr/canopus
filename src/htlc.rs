@@ -121,13 +121,14 @@ impl HtlcManager {
 
         match self
             .controller
-            .channel_handle_htlc_add(
+            .channel_handle_htlc_add_with_upstream_expiry(
                 &peer_id,
                 htlc,
                 result_key,
                 incoming_scid,
                 pending_htlc.incoming_htlc_id,
                 pending_htlc.shared_secret,
+                Some(cltv_expiry),
             )
             .await
         {
@@ -249,6 +250,8 @@ mod tests {
             incoming_htlc_id: 1,
             outgoing_scid: 2,
             outgoing_htlc_id: 2,
+            upstream_cltv_expiry: None,
+            hosted_commit_deadline_unix: None,
             payment_hash: [3; 32],
             shared_secret: Some([4; 32]),
         };

@@ -125,6 +125,8 @@ pub struct MockNode {
     pub notifications: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
     pub payment_results: std::sync::Mutex<HashMap<String, PaymentStatus>>,
     pub send_onion_error: std::sync::Mutex<Option<String>>,
+    pub send_custom_msg_error: std::sync::Mutex<Option<String>>,
+    pub send_custom_msg_fail_after: std::sync::Mutex<Option<(usize, String)>>,
     pub node_info: std::sync::Mutex<Option<NodeInfo>>,
     pub raw_blocks: std::sync::Mutex<HashMap<u32, String>>,
 }
@@ -158,6 +160,8 @@ impl MockNode {
             notifications: std::sync::Mutex::new(Vec::new()),
             payment_results: std::sync::Mutex::new(HashMap::new()),
             send_onion_error: std::sync::Mutex::new(None),
+            send_custom_msg_error: std::sync::Mutex::new(None),
+            send_custom_msg_fail_after: std::sync::Mutex::new(None),
             node_info: std::sync::Mutex::new(Some(info)),
             raw_blocks: std::sync::Mutex::new(HashMap::new()),
         }
@@ -179,6 +183,18 @@ impl MockNode {
         *self.send_onion_error.lock().unwrap() = Some(message.into());
     }
 
+    pub fn fail_next_send_custom_msg(&self, message: impl Into<String>) {
+        *self.send_custom_msg_error.lock().unwrap() = Some(message.into());
+    }
+
+    pub fn fail_send_custom_msg_after_successes(
+        &self,
+        successes: usize,
+        message: impl Into<String>,
+    ) {
+        *self.send_custom_msg_fail_after.lock().unwrap() = Some((successes, message.into()));
+    }
+
     pub fn set_raw_block(&self, height: u32, block_hex: String) {
         self.raw_blocks.lock().unwrap().insert(height, block_hex);
     }
@@ -187,6 +203,17 @@ impl MockNode {
 #[async_trait]
 impl NodeActions for MockNode {
     async fn send_custom_msg(&self, peer_pubkey: &PublicKey, msg_bytes: Bytes) -> NodeResult<()> {
+        if let Some(message) = self.send_custom_msg_error.lock().unwrap().take() {
+            return Err(NodeError::Rpc(message));
+        }
+        let mut delayed_failure = self.send_custom_msg_fail_after.lock().unwrap();
+        if let Some((successes, _)) = delayed_failure.as_mut() {
+            if *successes == 0 {
+                let (_, message) = delayed_failure.take().unwrap();
+                return Err(NodeError::Rpc(message));
+            }
+            *successes -= 1;
+        }
         self.sent_messages
             .lock()
             .unwrap()

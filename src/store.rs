@@ -171,6 +171,14 @@ pub struct ForwardLink {
     pub incoming_htlc_id: u64,
     pub outgoing_scid: u64,
     pub outgoing_htlc_id: u64,
+    /// Expiry of the upstream normal-channel HTLC, when this link originated
+    /// from `htlc_accepted`. Absent for hosted-originated forwards.
+    #[serde(default)]
+    pub upstream_cltv_expiry: Option<u32>,
+    /// Wall-clock deadline for the hosted peer to commit an offered HTLC.
+    /// Absent for non-hosted forwards and links written before watchdog support.
+    #[serde(default)]
+    pub hosted_commit_deadline_unix: Option<u64>,
     #[serde(with = "serde_array_hex_32")]
     pub payment_hash: [u8; 32],
     #[serde(default, with = "serde_option_array_hex_32")]

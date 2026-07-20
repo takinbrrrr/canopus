@@ -58,6 +58,33 @@ impl ClnNode {
             .await?;
         first_hop_from_listchannels(&self.node_id, scid, &response)
     }
+
+    pub async fn peer_connection_states(&self) -> NodeResult<HashMap<PublicKey, bool>> {
+        let response = self.call("listpeers", json!({})).await?;
+        peer_connection_states_from_listpeers(&response)
+    }
+}
+
+fn peer_connection_states_from_listpeers(response: &Value) -> NodeResult<HashMap<PublicKey, bool>> {
+    let peers = response
+        .get("peers")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| NodeError::Rpc("listpeers missing peers array".into()))?;
+    let mut states = HashMap::new();
+    for peer in peers {
+        let Some(id) = peer.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Ok(id) = PublicKey::from_str(id) else {
+            continue;
+        };
+        let connected = peer
+            .get("connected")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        states.insert(id, connected);
+    }
+    Ok(states)
 }
 
 fn first_hop_from_listchannels(
@@ -374,6 +401,22 @@ mod tests {
 
         let first_hop = first_hop_from_listchannels(&node, scid, &response).unwrap();
         assert_eq!(first_hop.id, peer);
+    }
+
+    #[test]
+    fn listpeers_connection_states_include_connected_and_disconnected_peers() {
+        let connected = pubkey(2);
+        let disconnected = pubkey(3);
+        let states = peer_connection_states_from_listpeers(&json!({
+            "peers": [
+                { "id": connected.to_string(), "connected": true },
+                { "id": disconnected.to_string(), "connected": false }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(states.get(&connected), Some(&true));
+        assert_eq!(states.get(&disconnected), Some(&false));
     }
 
     #[test]

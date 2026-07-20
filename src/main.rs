@@ -224,7 +224,9 @@ async fn main() -> anyhow::Result<()> {
             hsm_secret_path,
         })
         .await?;
-    spawn_committed_htlc_recovery(runtime);
+    spawn_committed_htlc_recovery(runtime.clone());
+    spawn_peer_connection_hydration(runtime.clone());
+    spawn_forward_deadline_enforcement(runtime);
 
     tracing::info!("canopus plugin started");
     plugin.join().await?;
@@ -250,6 +252,7 @@ async fn build_runtime(
         node_secret: keys.secret,
         node_public,
         peer_wire_encodings: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        peer_connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
     Ok(RuntimeState::Unlocked {
         controller,
@@ -269,6 +272,43 @@ fn spawn_committed_htlc_recovery(runtime: Arc<RwLock<RuntimeState>>) {
         if let Some(controller) = controller {
             if let Err(err) = controller.recover_committed_htlcs().await {
                 tracing::warn!(error_message = %err, "failed to recover committed hosted HTLCs on startup");
+            }
+        }
+    });
+}
+
+fn spawn_peer_connection_hydration(runtime: Arc<RwLock<RuntimeState>>) {
+    tokio::spawn(async move {
+        let (controller, cln_node) = match &*runtime.read().await {
+            RuntimeState::Unlocked {
+                controller,
+                cln_node,
+                ..
+            } => (controller.clone(), cln_node.clone()),
+            RuntimeState::Locked { .. } => return,
+        };
+        match cln_node.peer_connection_states().await {
+            Ok(connections) => controller.note_initial_peer_connections(connections).await,
+            Err(err) => {
+                tracing::warn!(error_message = %err, "could not initialize hosted peer connection cache");
+            }
+        }
+    });
+}
+
+fn spawn_forward_deadline_enforcement(runtime: Arc<RwLock<RuntimeState>>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let controller = match &*runtime.read().await {
+                RuntimeState::Unlocked { controller, .. } => Some(controller.clone()),
+                RuntimeState::Locked { .. } => None,
+            };
+            if let Some(controller) = controller {
+                if let Err(err) = controller.enforce_forward_deadlines().await {
+                    tracing::warn!(error_message = %err, "failed to enforce hosted forwarding deadlines");
+                }
             }
         }
     });
@@ -363,7 +403,10 @@ fn compute_feature_bits_hex(bits: &[u64]) -> String {
 
 /// Plugin handlers — bridge CLN plugin messages to the channel controller.
 mod handler {
-    use super::{build_runtime, spawn_committed_htlc_recovery, PluginState, RuntimeState};
+    use super::{
+        build_runtime, spawn_committed_htlc_recovery, spawn_peer_connection_hydration, PluginState,
+        RuntimeState,
+    };
     use bytes::Bytes;
     use canopus::channel::SetChannelParams;
     use canopus::channel_id::{
@@ -459,14 +502,43 @@ mod handler {
         request
             .get(key)
             .or_else(|| request.get("params").and_then(|p| p.get(key)))
+            .or_else(|| {
+                request
+                    .get("params")
+                    .and_then(|p| p.get("params"))
+                    .and_then(|p| p.get(key))
+            })
     }
 
-    fn arg<'a>(request: &'a Value, index: usize, key: &str) -> Option<&'a Value> {
-        param(request, key).or_else(|| request.as_array().and_then(|a| a.get(index)))
+    pub(super) fn arg<'a>(request: &'a Value, index: usize, key: &str) -> Option<&'a Value> {
+        param(request, key).or_else(|| {
+            request
+                .as_array()
+                .or_else(|| request.get("params").and_then(Value::as_array))
+                .or_else(|| {
+                    request
+                        .get("params")
+                        .and_then(|params| params.get("params"))
+                        .and_then(Value::as_array)
+                })
+                .and_then(|args| args.get(index))
+        })
     }
 
     fn parse_peer(s: &str) -> Result<PublicKey, cln_plugin::Error> {
         PublicKey::from_str(s).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub(super) fn notification_peer<'a>(request: &'a Value, topic: &str) -> Option<&'a str> {
+        param(request, "id")
+            .or_else(|| param(request, "peer_id"))
+            .or_else(|| request.get(topic).and_then(|payload| payload.get("id")))
+            .or_else(|| {
+                request
+                    .get(topic)
+                    .and_then(|payload| payload.get("peer_id"))
+            })
+            .and_then(Value::as_str)
     }
 
     fn parse_msat(value: &Value) -> Option<u64> {
@@ -651,18 +723,19 @@ mod handler {
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<(), cln_plugin::Error> {
-        if let Some(peer) = param(&request, "id").and_then(|v| v.as_str()) {
+        if let Some(peer) = notification_peer(&request, "connect") {
             if is_locked(&plugin).await {
                 return Ok(());
             }
             let peer = parse_peer(peer)?;
-            controller(&plugin).await?.handle_connect(&peer).await?;
+            let controller = controller(&plugin).await?;
+            controller.note_peer_connection(&peer, true).await;
+            controller.handle_connect(&peer).await?;
             return Ok(());
         }
         if is_locked(&plugin).await {
             return Ok(());
         }
-        let _ = controller(&plugin).await?;
         Ok(())
     }
 
@@ -670,12 +743,14 @@ mod handler {
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<(), cln_plugin::Error> {
-        if let Some(peer) = param(&request, "id").and_then(|v| v.as_str()) {
+        if let Some(peer) = notification_peer(&request, "disconnect") {
             if is_locked(&plugin).await {
                 return Ok(());
             }
             let peer = parse_peer(peer)?;
-            controller(&plugin).await?.handle_disconnect(&peer).await?;
+            let controller = controller(&plugin).await?;
+            controller.note_peer_connection(&peer, false).await;
+            controller.handle_disconnect(&peer).await?;
         }
         Ok(())
     }
@@ -923,13 +998,14 @@ mod handler {
                 tlv_stream: Bytes::new(),
             };
             controller
-                .channel_handle_htlc_add(
+                .channel_handle_htlc_add_with_upstream_expiry(
                     &peer_id,
                     htlc,
                     &result_key,
                     incoming_scid,
                     htlc_id,
                     shared_secret,
+                    Some(incoming_cltv_expiry),
                 )
                 .await?;
             loop {
@@ -1306,6 +1382,7 @@ mod handler {
         };
         *plugin.state().runtime.write().await = runtime;
         spawn_committed_htlc_recovery(plugin.state().runtime.clone());
+        spawn_peer_connection_hydration(plugin.state().runtime.clone());
         Ok(json!({ "status": "unlocked", "locked": false, "node_id": node_id }))
     }
 }
@@ -1341,6 +1418,45 @@ mod tests {
         assert_eq!(
             handler::hook_continue(),
             serde_json::json!({ "result": "continue" })
+        );
+    }
+
+    #[test]
+    fn arg_reads_positional_params_array() {
+        let request = serde_json::json!({
+            "params": ["secret", 1_000_000, 10_000],
+        });
+        assert_eq!(
+            handler::arg(&request, 0, "secret").and_then(|value| value.as_str()),
+            Some("secret")
+        );
+        assert_eq!(
+            handler::arg(&request, 1, "capacity_msat").and_then(|value| value.as_u64()),
+            Some(1_000_000)
+        );
+
+        let nested = serde_json::json!({
+            "params": { "params": ["nested-secret", 2_000_000] },
+        });
+        assert_eq!(
+            handler::arg(&nested, 0, "secret").and_then(|value| value.as_str()),
+            Some("nested-secret")
+        );
+    }
+
+    #[test]
+    fn notification_peer_accepts_direct_and_wrapped_payloads() {
+        let peer = "036e559fcf1d9530097a8a33accbfe140c18e0673c55dadb173052f8165b8ba1ad";
+        assert_eq!(
+            handler::notification_peer(&serde_json::json!({ "id": peer }), "connect"),
+            Some(peer)
+        );
+        assert_eq!(
+            handler::notification_peer(
+                &serde_json::json!({ "connect": { "peer_id": peer } }),
+                "connect"
+            ),
+            Some(peer)
         );
     }
 

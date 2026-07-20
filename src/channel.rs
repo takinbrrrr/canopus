@@ -33,6 +33,10 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+const HOSTED_DELIVERY_FAILED_ERROR: &str = "hosted HTLC delivery failed after upstream acceptance";
+const HOSTED_HTLC_EXPIRED_ERROR: &str = "hosted HTLC expired before settlement";
+const HOSTED_COMMIT_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Error)]
 pub enum ChannelError {
     #[error("state error: {0}")]
@@ -229,6 +233,7 @@ pub struct ChannelController {
     pub node_secret: SecretKey,
     pub node_public: PublicKey,
     pub peer_wire_encodings: Arc<Mutex<HashMap<PublicKey, WireEncoding>>>,
+    pub peer_connections: Arc<Mutex<HashMap<PublicKey, bool>>>,
 }
 
 impl ChannelController {
@@ -263,6 +268,25 @@ impl ChannelController {
             .lock()
             .await
             .insert(*peer_id, encoding);
+    }
+
+    pub async fn note_peer_connection(&self, peer_id: &PublicKey, connected: bool) {
+        self.peer_connections
+            .lock()
+            .await
+            .insert(*peer_id, connected);
+    }
+
+    pub async fn note_initial_peer_connections(&self, connections: HashMap<PublicKey, bool>) {
+        let mut known_connections = self.peer_connections.lock().await;
+        for (peer_id, connected) in connections {
+            // Subscription events received before the initial RPC snapshot are newer.
+            known_connections.entry(peer_id).or_insert(connected);
+        }
+    }
+
+    async fn peer_is_known_disconnected(&self, peer_id: &PublicKey) -> bool {
+        matches!(self.peer_connections.lock().await.get(peer_id), Some(false))
     }
 
     async fn peer_wire_encoding(&self, peer_id: &PublicKey) -> WireEncoding {
@@ -1118,6 +1142,14 @@ impl ChannelController {
         if status != Status::Active && status != Status::Errored {
             return Ok(());
         }
+        if data
+            .local_errors
+            .iter()
+            .any(|error| error == HOSTED_DELIVERY_FAILED_ERROR)
+        {
+            debug!(%peer_id, htlc_id = msg.id, "ignoring fulfill after hosted delivery failure");
+            return Ok(());
+        }
 
         if has_uncommitted_remote_resolution(&data, msg.id) {
             debug!(%peer_id, htlc_id = msg.id, "ignoring duplicate remote malformed fail");
@@ -1165,6 +1197,13 @@ impl ChannelController {
             return Ok(());
         }
 
+        if data.local_errors.iter().any(|error| {
+            error == HOSTED_DELIVERY_FAILED_ERROR || error == HOSTED_HTLC_EXPIRED_ERROR
+        }) {
+            debug!(%peer_id, htlc_id = msg.id, "ignoring fulfill after hosted forwarding failure");
+            return Ok(());
+        }
+
         if has_uncommitted_remote_resolution(&data, msg.id) {
             debug!(%peer_id, htlc_id = msg.id, "ignoring duplicate remote fulfill");
             return Ok(());
@@ -1192,6 +1231,28 @@ impl ChannelController {
                 return Ok(());
             }
 
+            if !self.hosted_settlement_is_safe(peer_id, htlc).await? {
+                warn!(%peer_id, htlc_id = msg.id, "rejecting hosted fulfill after hosted HTLC expiry");
+                self.mark_errored(
+                    peer_id,
+                    &data,
+                    "hosted fulfill arrived after hosted HTLC expiry",
+                )
+                .await?;
+                self.send_message(
+                    peer_id,
+                    HostedMessage::Error(HcError {
+                        channel_id: channel_id(&self.node_public, peer_id),
+                        data: Bytes::from_static(
+                            b"hosted fulfill arrived after hosted HTLC expiry",
+                        ),
+                        tlv_stream: Bytes::new(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+
             // Persist preimage for safety before processing
             self.node
                 .store_preimage(&htlc.payment_hash, &preimage)
@@ -1215,6 +1276,47 @@ impl ChannelController {
         }
 
         Ok(())
+    }
+
+    async fn hosted_settlement_is_safe(
+        &self,
+        peer_id: &PublicKey,
+        outgoing_htlc: &UpdateAddHtlc,
+    ) -> ChannelResult<bool> {
+        let hosted_scid = hosted_short_channel_id(&self.node_public, peer_id);
+        let key = Self::forward_key(hosted_scid, outgoing_htlc.htlc_id());
+        let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
+        let link = match crate::store::get_json::<ForwardLink>(self.store.as_ref(), &key_ref).await
+        {
+            Ok((link, _)) => link,
+            Err(StoreError::NotFound(_)) => return Ok(true),
+            Err(err) => return Err(err.into()),
+        };
+        if self
+            .peer_for_hosted_scid(link.incoming_scid)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let Some(expiry) = link.upstream_cltv_expiry else {
+            // Links persisted before expiry tracking cannot safely be resumed
+            // if they originated from a normal channel.
+            return Ok(false);
+        };
+        let data = self
+            .load_channel(peer_id)
+            .await?
+            .ok_or(ChannelError::NotFound(hex::encode(peer_id.serialize())))?;
+        let routing = self.routing_policy_for_data(&data).await?;
+        let required_upstream_expiry = outgoing_htlc
+            .cltv_expiry
+            .checked_add(routing.cltv_expiry_delta as u32)
+            .ok_or(ChannelError::InvalidMessage(
+                "hosted CLTV expiry overflow".into(),
+            ))?;
+        let height = self.node.get_block_height().await?;
+        Ok(height < outgoing_htlc.cltv_expiry && required_upstream_expiry <= expiry)
     }
 
     /// Handle an `update_fail_htlc` from the peer.
@@ -2088,6 +2190,15 @@ impl ChannelController {
             if has_uncommitted_remote_resolution(data, htlc.htlc_id()) {
                 continue;
             }
+            if !self.hosted_settlement_is_safe(peer_id, htlc).await? {
+                self.mark_errored(
+                    peer_id,
+                    data,
+                    "hosted HTLC outlived upstream CLTV safety deadline",
+                )
+                .await?;
+                return Ok(());
+            }
             if let Some(preimage) = self.node.lookup_preimage(&htlc.payment_hash).await? {
                 self.resolve_forward_fulfill(hosted_scid, htlc.htlc_id(), preimage)
                     .await?;
@@ -2244,15 +2355,30 @@ impl ChannelController {
                 tlv_stream: Bytes::new(),
             };
             let result_key = format!("{hosted_scid}/{}", htlc.htlc_id());
-            self.channel_handle_htlc_add(
-                &target_peer,
-                outgoing_htlc,
-                &result_key,
-                hosted_scid,
-                htlc.htlc_id(),
-                Some(peeled.shared_secret),
-            )
-            .await?;
+            if let Err(err) = self
+                .channel_handle_htlc_add(
+                    &target_peer,
+                    outgoing_htlc,
+                    &result_key,
+                    hosted_scid,
+                    htlc.htlc_id(),
+                    Some(peeled.shared_secret),
+                )
+                .await
+            {
+                let reason = self.failure_onion_for_peer_htlc(htlc, 0x1007);
+                self.send_local_fail_for_htlc(peer_id, htlc.htlc_id(), reason)
+                    .await?;
+                if let Some(link) = self
+                    .forward_link_for_incoming(hosted_scid, htlc.htlc_id())
+                    .await?
+                {
+                    let key = Self::forward_key(link.outgoing_scid, link.outgoing_htlc_id);
+                    let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+                    self.store.delete(&key_ref).await?;
+                }
+                warn!(%peer_id, %target_peer, error_message = %err, "hosted-to-hosted delivery failed");
+            }
             return Ok(());
         }
 
@@ -2262,6 +2388,8 @@ impl ChannelController {
             incoming_htlc_id: htlc.htlc_id(),
             outgoing_scid,
             outgoing_htlc_id,
+            upstream_cltv_expiry: None,
+            hosted_commit_deadline_unix: None,
             payment_hash: htlc.payment_hash,
             shared_secret: Some(peeled.shared_secret),
         };
@@ -2908,6 +3036,30 @@ impl ChannelController {
         incoming_htlc_id: u64,
         shared_secret: Option<[u8; 32]>,
     ) -> ChannelResult<()> {
+        let upstream_cltv_expiry = htlc.cltv_expiry;
+        self.channel_handle_htlc_add_with_upstream_expiry(
+            peer_id,
+            htlc,
+            result_key,
+            incoming_scid,
+            incoming_htlc_id,
+            shared_secret,
+            Some(upstream_cltv_expiry),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn channel_handle_htlc_add_with_upstream_expiry(
+        &self,
+        peer_id: &PublicKey,
+        htlc: UpdateAddHtlc,
+        result_key: &str,
+        incoming_scid: u64,
+        incoming_htlc_id: u64,
+        shared_secret: Option<[u8; 32]>,
+        upstream_cltv_expiry: Option<u32>,
+    ) -> ChannelResult<()> {
         let data = self
             .load_channel(peer_id)
             .await?
@@ -2916,6 +3068,19 @@ impl ChannelController {
         let status = derive_status(&data);
         if status != Status::Active {
             return Err(ChannelError::Errored);
+        }
+
+        if self.peer_is_known_disconnected(peer_id).await {
+            self.node
+                .resolve_htlc(
+                    result_key,
+                    HtlcResolution::FailMessage {
+                        code: 0x1007,
+                        data: Bytes::new(),
+                    },
+                )
+                .await?;
+            return Ok(());
         }
 
         // Check for known preimage (idempotency)
@@ -2929,6 +3094,29 @@ impl ChannelController {
         // Validate HTLC parameters
         let policy = &data.lcss.init_hosted_channel;
         let routing = self.routing_policy_for_data(&data).await?;
+        let normal_source = self.peer_for_hosted_scid(incoming_scid).await?.is_none();
+        if let Some(upstream_cltv_expiry) = upstream_cltv_expiry {
+            if normal_source
+                && upstream_cltv_expiry
+                    < htlc
+                        .cltv_expiry
+                        .checked_add(routing.cltv_expiry_delta as u32)
+                        .ok_or(ChannelError::InvalidMessage(
+                            "hosted CLTV expiry overflow".into(),
+                        ))?
+            {
+                self.node
+                    .resolve_htlc(
+                        result_key,
+                        HtlcResolution::FailMessage {
+                            code: 0x100d, // incorrect_cltv_expiry
+                            data: Bytes::new(),
+                        },
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
         if htlc.amount_msat < policy.htlc_minimum_msat {
             self.node
                 .resolve_htlc(
@@ -3018,6 +3206,19 @@ impl ChannelController {
             incoming_htlc_id,
             outgoing_scid: hosted_scid,
             outgoing_htlc_id: htlc_id,
+            upstream_cltv_expiry,
+            hosted_commit_deadline_unix: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| {
+                        ChannelError::InvalidMessage("system clock is before Unix epoch".into())
+                    })?
+                    .as_secs()
+                    .checked_add(HOSTED_COMMIT_TIMEOUT_SECS)
+                    .ok_or_else(|| {
+                        ChannelError::InvalidMessage("hosted commit deadline overflow".into())
+                    })?,
+            ),
             payment_hash: htlc.payment_hash,
             shared_secret,
         };
@@ -3041,23 +3242,35 @@ impl ChannelController {
         sm.uncommitted = new_data.uncommitted.clone();
 
         // Send update_add_htlc to client
-        self.send_message(peer_id, HostedMessage::UpdateAddHtlc(htlc))
-            .await?;
+        if let Err(err) = self
+            .send_message(peer_id, HostedMessage::UpdateAddHtlc(htlc))
+            .await
+        {
+            self.mark_errored(peer_id, &new_data, HOSTED_DELIVERY_FAILED_ERROR)
+                .await?;
+            return Err(err);
+        }
 
         // Send state_update
         let mut next = sm.lcss_next()?;
         next.block_day = self.current_block_day().await?;
         next.sign(&self.node_secret)?;
-        self.send_message(
-            peer_id,
-            HostedMessage::StateUpdate(StateUpdate {
-                block_day: next.block_day,
-                local_updates: next.local_updates,
-                remote_updates: next.remote_updates,
-                local_sig_of_remote: next.local_sig_of_remote,
-            }),
-        )
-        .await?;
+        if let Err(err) = self
+            .send_message(
+                peer_id,
+                HostedMessage::StateUpdate(StateUpdate {
+                    block_day: next.block_day,
+                    local_updates: next.local_updates,
+                    remote_updates: next.remote_updates,
+                    local_sig_of_remote: next.local_sig_of_remote,
+                }),
+            )
+            .await
+        {
+            self.mark_errored(peer_id, &new_data, HOSTED_DELIVERY_FAILED_ERROR)
+                .await?;
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -3092,7 +3305,96 @@ impl ChannelController {
         self.load_channel(peer_id).await
     }
 
+    pub async fn enforce_forward_deadlines(&self) -> ChannelResult<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ChannelError::InvalidMessage("system clock is before Unix epoch".into()))?
+            .as_secs();
+        self.enforce_forward_deadlines_at(now).await
+    }
+
+    pub async fn enforce_forward_deadlines_at(&self, now: u64) -> ChannelResult<()> {
+        let mut current_height = None;
+        'channels: for peer_id in self.list_channels().await? {
+            let Some(data) = self.load_channel(&peer_id).await? else {
+                continue;
+            };
+            if derive_status(&data) != Status::Active {
+                continue;
+            }
+
+            let hosted_scid = hosted_short_channel_id(&self.node_public, &peer_id);
+            for update in &data.uncommitted {
+                let crate::store::UncommittedUpdate::Local(PendingUpdate::Add { htlc }) = update
+                else {
+                    continue;
+                };
+                let key = Self::forward_key(hosted_scid, htlc.htlc_id());
+                let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+                let link = match crate::store::get_json::<ForwardLink>(
+                    self.store.as_ref(),
+                    &key_ref,
+                )
+                .await
+                {
+                    Ok((link, _)) => link,
+                    Err(StoreError::NotFound(_)) => continue,
+                    Err(err) => return Err(err.into()),
+                };
+                if link
+                    .hosted_commit_deadline_unix
+                    .is_none_or(|deadline| deadline > now)
+                {
+                    continue;
+                }
+
+                self.mark_errored(&peer_id, &data, HOSTED_DELIVERY_FAILED_ERROR)
+                    .await?;
+                self.resolve_forward_fail(hosted_scid, htlc.htlc_id(), &0x1007u16.to_be_bytes())
+                    .await?;
+                continue 'channels;
+            }
+
+            for htlc in &data.lcss.outgoing_htlcs {
+                let key = Self::forward_key(hosted_scid, htlc.htlc_id());
+                let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+                let link = match crate::store::get_json::<ForwardLink>(
+                    self.store.as_ref(),
+                    &key_ref,
+                )
+                .await
+                {
+                    Ok((link, _)) => link,
+                    Err(StoreError::NotFound(_)) => continue,
+                    Err(err) => return Err(err.into()),
+                };
+                if link.upstream_cltv_expiry.is_none() {
+                    continue;
+                }
+                let height = match current_height {
+                    Some(height) => height,
+                    None => {
+                        let height = self.node.get_block_height().await?;
+                        current_height = Some(height);
+                        height
+                    }
+                };
+                if height < htlc.cltv_expiry {
+                    continue;
+                }
+
+                self.mark_errored(&peer_id, &data, HOSTED_HTLC_EXPIRED_ERROR)
+                    .await?;
+                self.resolve_forward_fail(hosted_scid, htlc.htlc_id(), &0x4008u16.to_be_bytes())
+                    .await?;
+                continue 'channels;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn handle_connect(&self, peer_id: &PublicKey) -> ChannelResult<()> {
+        self.note_peer_connection(peer_id, true).await;
         let Some(data) = self.load_channel(peer_id).await? else {
             return Ok(());
         };
@@ -3105,6 +3407,7 @@ impl ChannelController {
 
     /// Handle a disconnect notification.
     pub async fn handle_disconnect(&self, peer_id: &PublicKey) -> ChannelResult<()> {
+        self.note_peer_connection(peer_id, false).await;
         self.peer_wire_encodings.lock().await.remove(peer_id);
         // Nothing to do — state is persisted; reconciliation happens on reconnect
         Ok(())
@@ -3129,6 +3432,7 @@ mod tests {
             node_secret: secret,
             node_public: public,
             peer_wire_encodings: Arc::new(Mutex::new(HashMap::new())),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
         };
         (controller, node)
     }

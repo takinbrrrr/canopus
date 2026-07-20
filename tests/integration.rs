@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use sha2::Digest;
 
 use canopus::channel::{ChannelController, SetChannelParams, Status};
 use canopus::channel_id::hosted_short_channel_id;
@@ -43,6 +44,7 @@ async fn make_harness(
         node_secret: host_secret,
         node_public: host_public,
         peer_wire_encodings: Arc::new(Mutex::new(HashMap::new())),
+        peer_connections: Arc::new(Mutex::new(HashMap::new())),
     });
 
     (controller, node, client_secret, client_public)
@@ -608,7 +610,15 @@ async fn test_reconnect_replays_persisted_add_id() {
         tlv_stream: Bytes::new(),
     };
     controller
-        .channel_handle_htlc_add(&client_public, htlc, "1/7", 1, 7, Some([9; 32]))
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "1/7",
+            1,
+            7,
+            Some([9; 32]),
+            Some(700_106),
+        )
         .await
         .unwrap();
     node.sent_messages.lock().unwrap().clear();
@@ -679,7 +689,15 @@ async fn test_htlc_add_to_active_channel() {
 
     // The controller should add the HTLC and send update_add_htlc to client
     controller
-        .channel_handle_htlc_add(&client_public, htlc, "test-key-1", 1, 1, Some([9; 32]))
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "test-key-1",
+            1,
+            1,
+            Some([9; 32]),
+            Some(700_106),
+        )
         .await
         .unwrap();
 
@@ -730,7 +748,15 @@ async fn test_state_update_accepts_client_view_counters() {
         tlv_stream: Bytes::new(),
     };
     controller
-        .channel_handle_htlc_add(&client_public, htlc, "test-key", 1, 1, Some([9; 32]))
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "test-key",
+            1,
+            1,
+            Some([9; 32]),
+            Some(700_106),
+        )
         .await
         .unwrap();
 
@@ -832,7 +858,15 @@ async fn test_fulfill_after_client_view_state_update_resolves_upstream() {
         tlv_stream: Bytes::new(),
     };
     controller
-        .channel_handle_htlc_add(&client_public, htlc, "1/1", 1, 1, Some([9; 32]))
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "1/1",
+            1,
+            1,
+            Some([9; 32]),
+            Some(700_106),
+        )
         .await
         .unwrap();
 
@@ -881,6 +915,547 @@ async fn test_fulfill_after_client_view_state_update_resolves_upstream() {
 }
 
 #[tokio::test]
+async fn test_expired_upstream_htlc_cannot_be_fulfilled_by_hosted_peer() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let preimage = [0x44u8; 32];
+    let payment_hash = sha2::Digest::finalize(sha2::Sha256::new_with_prefix(preimage)).into();
+    let htlc = UpdateAddHtlc {
+        channel_id: [0u8; 32],
+        id: 0,
+        amount_msat: 10_000_000,
+        payment_hash,
+        cltv_expiry: 700_001,
+        onion_routing_packet: Bytes::from(
+            canopus::sphinx::create_single_hop_onion(
+                &client_public,
+                10_000_000,
+                700_001,
+                None,
+                &payment_hash,
+            )
+            .unwrap(),
+        ),
+        tlv_stream: Bytes::new(),
+    };
+
+    controller
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "1/1",
+            1,
+            1,
+            Some([9; 32]),
+            Some(700_007),
+        )
+        .await
+        .unwrap();
+
+    let data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut state = StateManager::new(data.lcss.clone());
+    state.uncommitted = data.uncommitted.clone();
+    let mut client_view = state.lcss_next().unwrap().reverse();
+    client_view.sign(&client_secret).unwrap();
+    controller
+        .handle_state_update(
+            &client_public,
+            StateUpdate {
+                block_day: client_view.block_day,
+                local_updates: client_view.local_updates,
+                remote_updates: client_view.remote_updates,
+                local_sig_of_remote: client_view.local_sig_of_remote,
+            },
+        )
+        .await
+        .unwrap();
+
+    node.set_block_height(700_001);
+
+    controller
+        .handle_update_fulfill(
+            &client_public,
+            UpdateFulfillHtlc {
+                channel_id: client_view.incoming_htlcs[0].channel_id,
+                id: 1,
+                payment_preimage: preimage,
+                tlv_stream: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(node.htlc_resolutions.lock().unwrap().is_empty());
+    assert!(!node.preimages.lock().unwrap().contains_key(&payment_hash));
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Errored
+    );
+    let data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(data.uncommitted.is_empty());
+    assert_eq!(data.lcss.outgoing_htlcs.len(), 1);
+}
+
+#[tokio::test]
+async fn test_normal_to_hosted_requires_target_channel_cltv_delta() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+
+    let mut data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    data.routing_policy.as_mut().unwrap().cltv_expiry_delta = 12;
+    controller
+        .save_channel(&client_public, &data, None)
+        .await
+        .unwrap();
+
+    let htlc = UpdateAddHtlc {
+        channel_id: [0; 32],
+        id: 0,
+        amount_msat: 10_000_000,
+        payment_hash: [0x46; 32],
+        cltv_expiry: 700_001,
+        onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
+    };
+    controller
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "1/2",
+            1,
+            2,
+            Some([9; 32]),
+            Some(700_012),
+        )
+        .await
+        .unwrap();
+
+    assert!(node
+        .htlc_resolutions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(key, resolution)| matches!(
+            resolution,
+            HtlcResolution::FailMessage { code: 0x100d, .. } if key == "1/2"
+        )));
+    let data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(data.uncommitted.is_empty());
+}
+
+#[tokio::test]
+async fn test_known_disconnected_hosted_target_fails_normal_upstream_without_state_change() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+    controller.note_peer_connection(&client_public, false).await;
+
+    controller
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            UpdateAddHtlc {
+                channel_id: [0; 32],
+                id: 0,
+                amount_msat: 10_000_000,
+                payment_hash: [0x48; 32],
+                cltv_expiry: 700_100,
+                onion_routing_packet: Bytes::from(vec![0; 1366]),
+                tlv_stream: Bytes::new(),
+            },
+            "1/4",
+            1,
+            4,
+            Some([9; 32]),
+            Some(700_106),
+        )
+        .await
+        .unwrap();
+
+    assert!(node
+        .htlc_resolutions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(key, resolution)| matches!(
+            resolution,
+            HtlcResolution::FailMessage { code: 0x1007, .. } if key == "1/4"
+        )));
+    assert!(node.sent_messages.lock().unwrap().is_empty());
+    let data = controller
+        .get_channel_data(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(data.uncommitted.is_empty());
+}
+
+#[tokio::test]
+async fn test_uncommitted_hosted_add_timeout_fails_normal_upstream() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            UpdateAddHtlc {
+                channel_id: [0; 32],
+                id: 0,
+                amount_msat: 10_000_000,
+                payment_hash: [0x49; 32],
+                cltv_expiry: 700_100,
+                onion_routing_packet: Bytes::from(vec![0; 1366]),
+                tlv_stream: Bytes::new(),
+            },
+            "1/5",
+            1,
+            5,
+            Some([9; 32]),
+            Some(700_106),
+        )
+        .await
+        .unwrap();
+
+    let hosted_scid = hosted_short_channel_id(&controller.node_public, &client_public);
+    let key = ChannelController::forward_key(hosted_scid, 1);
+    let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+    let (mut link, generation) = get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .unwrap();
+    link.hosted_commit_deadline_unix = Some(0);
+    canopus::store::update_json(controller.store.as_ref(), &key_ref, &link, generation)
+        .await
+        .unwrap();
+
+    controller.enforce_forward_deadlines_at(1).await.unwrap();
+
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Errored
+    );
+    assert!(node
+        .htlc_resolutions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(key, resolution)| matches!(
+            resolution,
+            HtlcResolution::Fail { .. } if key == "1/5"
+        )));
+    assert!(get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn test_committed_hosted_expiry_fails_normal_upstream_permanently() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    controller
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            UpdateAddHtlc {
+                channel_id: [0; 32],
+                id: 0,
+                amount_msat: 10_000_000,
+                payment_hash: [0x4a; 32],
+                cltv_expiry: 700_001,
+                onion_routing_packet: Bytes::from(vec![0; 1366]),
+                tlv_stream: Bytes::new(),
+            },
+            "1/6",
+            1,
+            6,
+            Some([9; 32]),
+            Some(700_007),
+        )
+        .await
+        .unwrap();
+    commit_peer_updates(&controller, &client_public, &client_secret).await;
+    node.set_block_height(700_001);
+
+    controller
+        .enforce_forward_deadlines_at(u64::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Errored
+    );
+    assert!(node
+        .htlc_resolutions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(key, resolution)| matches!(
+            resolution,
+            HtlcResolution::Fail { .. } if key == "1/6"
+        )));
+    let hosted_scid = hosted_short_channel_id(&controller.node_public, &client_public);
+    let key = ChannelController::forward_key(hosted_scid, 1);
+    let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+    assert!(get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn test_uncommitted_hosted_to_hosted_add_timeout_fails_source() {
+    let (controller, node, source_secret, source_public) = make_harness(false).await;
+    let secp = Secp256k1::new();
+    let (target_secret, target_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &source_secret,
+        &source_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    establish_channel(&controller, &node, &target_secret, &target_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let payment_hash = [0x4b; 32];
+    let target_scid = hosted_short_channel_id(&controller.node_public, &target_public);
+    controller
+        .handle_update_add(
+            &source_public,
+            UpdateAddHtlc {
+                channel_id: canopus::channel_id::channel_id(
+                    &controller.node_public,
+                    &source_public,
+                ),
+                id: 1,
+                amount_msat: 10_011_000,
+                payment_hash,
+                cltv_expiry: 700_300,
+                onion_routing_packet: Bytes::from(
+                    canopus::sphinx::create_relay_onion(
+                        &controller.node_public,
+                        &target_public,
+                        target_scid,
+                        10_000_000,
+                        700_100,
+                        &payment_hash,
+                    )
+                    .unwrap(),
+                ),
+                tlv_stream: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+    commit_peer_updates(&controller, &source_public, &source_secret).await;
+
+    let key = ChannelController::forward_key(target_scid, 1);
+    let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+    let (mut link, generation) = get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .unwrap();
+    link.hosted_commit_deadline_unix = Some(0);
+    canopus::store::update_json(controller.store.as_ref(), &key_ref, &link, generation)
+        .await
+        .unwrap();
+
+    controller.enforce_forward_deadlines_at(1).await.unwrap();
+
+    assert_eq!(
+        controller.get_status(&target_public).await.unwrap(),
+        Status::Errored
+    );
+    let source_fail = node
+        .sent_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|(peer, bytes)| {
+            if peer != &source_public {
+                return None;
+            }
+            match HostedMessage::decode(bytes).unwrap() {
+                HostedMessage::UpdateFailHtlc(fail) => Some(fail),
+                _ => None,
+            }
+        });
+    assert!(
+        matches!(source_fail, Some(UpdateFailHtlc { id: 1, reason, .. }) if reason.len() == 256)
+    );
+    assert!(get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn test_failed_normal_to_hosted_delivery_is_not_replayed_or_settled() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let preimage = [0x47; 32];
+    let payment_hash = sha2::Sha256::digest(preimage).into();
+    let htlc = UpdateAddHtlc {
+        channel_id: [0; 32],
+        id: 0,
+        amount_msat: 10_000_000,
+        payment_hash,
+        cltv_expiry: 700_100,
+        onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
+    };
+    node.fail_next_send_custom_msg("hosted peer offline");
+    assert!(controller
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "1/3",
+            1,
+            3,
+            Some([9; 32]),
+            Some(700_106),
+        )
+        .await
+        .is_err());
+
+    let data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        controller.get_status(&client_public).await.unwrap(),
+        Status::Errored
+    );
+    assert_eq!(data.uncommitted.len(), 1);
+
+    let hosted_scid = hosted_short_channel_id(&controller.node_public, &client_public);
+    let key = ChannelController::forward_key(hosted_scid, 1);
+    let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
+    assert!(get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .is_ok());
+
+    node.sent_messages.lock().unwrap().clear();
+    controller
+        .handle_invoke(&client_public, make_invoke(""))
+        .await
+        .unwrap();
+    assert!(
+        !node.sent_messages.lock().unwrap().iter().any(|(_, bytes)| {
+            matches!(
+                HostedMessage::decode(bytes),
+                Ok(HostedMessage::UpdateAddHtlc(_))
+            )
+        })
+    );
+
+    controller
+        .handle_update_fulfill(
+            &client_public,
+            UpdateFulfillHtlc {
+                channel_id: [0; 32],
+                id: 1,
+                payment_preimage: preimage,
+                tlv_stream: Bytes::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(node.htlc_resolutions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_restart_recovery_errors_hosted_htlc_past_upstream_safety_deadline() {
+    let (controller, node, client_secret, client_public) = make_harness(false).await;
+    establish_channel(&controller, &node, &client_secret, &client_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let payment_hash = [0x45u8; 32];
+    let hosted_scid = hosted_short_channel_id(&controller.node_public, &client_public);
+    let mut data = controller
+        .load_channel(&client_public)
+        .await
+        .unwrap()
+        .unwrap();
+    data.lcss.local_balance_msat = data
+        .lcss
+        .local_balance_msat
+        .checked_sub(10_000_000)
+        .unwrap();
+    data.lcss.local_updates += 1;
+    data.lcss.outgoing_htlcs.push(UpdateAddHtlc {
+        channel_id: [0; 32],
+        id: 1,
+        amount_msat: 10_000_000,
+        payment_hash,
+        cltv_expiry: 700_001,
+        onion_routing_packet: Bytes::from(vec![0; 1366]),
+        tlv_stream: Bytes::new(),
+    });
+    controller
+        .save_channel(&client_public, &data, None)
+        .await
+        .unwrap();
+
+    let link = ForwardLink {
+        incoming_scid: 1,
+        incoming_htlc_id: 1,
+        outgoing_scid: hosted_scid,
+        outgoing_htlc_id: 1,
+        upstream_cltv_expiry: Some(700_007),
+        hosted_commit_deadline_unix: None,
+        payment_hash,
+        shared_secret: Some([9; 32]),
+    };
+    let key = ChannelController::forward_key(hosted_scid, 1);
+    let key_ref: Vec<&str> = key.iter().map(|s| s.as_str()).collect();
+    canopus::store::create_json(controller.store.as_ref(), &key_ref, &link)
+        .await
+        .unwrap();
+
+    let restarted = ChannelController {
+        store: controller.store.clone(),
+        node: node.clone(),
+        config: controller.config.clone(),
+        node_secret: controller.node_secret,
+        node_public: controller.node_public,
+        peer_wire_encodings: Arc::new(Mutex::new(HashMap::new())),
+        peer_connections: Arc::new(Mutex::new(HashMap::new())),
+    };
+    node.set_block_height(700_001);
+    restarted.handle_connect(&client_public).await.unwrap();
+
+    assert_eq!(
+        restarted.get_status(&client_public).await.unwrap(),
+        Status::Errored
+    );
+    assert!(node.sent_messages.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_duplicate_remote_fulfill_is_idempotent_and_repaired_on_reconnect() {
     let (controller, node, client_secret, client_public) = make_harness(false).await;
     establish_channel(&controller, &node, &client_secret, &client_public).await;
@@ -910,7 +1485,15 @@ async fn test_duplicate_remote_fulfill_is_idempotent_and_repaired_on_reconnect()
         tlv_stream: Bytes::new(),
     };
     controller
-        .channel_handle_htlc_add(&client_public, htlc, "1/20", 1, 20, Some([9; 32]))
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "1/20",
+            1,
+            20,
+            Some([9; 32]),
+            Some(700_106),
+        )
         .await
         .unwrap();
 
@@ -1027,7 +1610,15 @@ async fn test_remove_channel_requires_force_with_inflight_htlcs() {
         tlv_stream: Bytes::new(),
     };
     controller
-        .channel_handle_htlc_add(&client_public, htlc, "test-key", 1, 1, Some([9; 32]))
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "test-key",
+            1,
+            1,
+            Some([9; 32]),
+            Some(700_106),
+        )
         .await
         .unwrap();
 
@@ -1073,13 +1664,14 @@ async fn test_consecutive_htlc_adds_use_local_update_ids() {
         };
 
         controller
-            .channel_handle_htlc_add(
+            .channel_handle_htlc_add_with_upstream_expiry(
                 &client_public,
                 htlc,
                 &format!("test-key-{}", index + 1),
                 1,
                 index as u64 + 1,
                 Some([9; 32]),
+                Some(700_106),
             )
             .await
             .unwrap();
@@ -1121,7 +1713,15 @@ async fn test_hosted_fail_wraps_upstream_failure() {
         tlv_stream: Bytes::new(),
     };
     controller
-        .channel_handle_htlc_add(&client_public, htlc, "9/42", 9, 42, Some([3; 32]))
+        .channel_handle_htlc_add_with_upstream_expiry(
+            &client_public,
+            htlc,
+            "9/42",
+            9,
+            42,
+            Some([3; 32]),
+            Some(700_106),
+        )
         .await
         .unwrap();
 
@@ -1356,6 +1956,85 @@ async fn test_hosted_to_hosted_fulfill_returns_to_source_peer() {
             ..
         }) if payment_preimage == preimage
     ));
+}
+
+#[tokio::test]
+async fn test_hosted_to_hosted_delivery_failure_fails_source_and_fences_target() {
+    let (controller, node, source_secret, source_public) = make_harness(false).await;
+    let secp = Secp256k1::new();
+    let (target_secret, target_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+
+    establish_channel_with_secret(
+        &controller,
+        &node,
+        &source_secret,
+        &source_public,
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100_000_000,
+        50_000_000,
+    )
+    .await;
+    establish_channel(&controller, &node, &target_secret, &target_public).await;
+    node.sent_messages.lock().unwrap().clear();
+
+    let payment_hash = [0x52; 32];
+    let target_scid = hosted_short_channel_id(&controller.node_public, &target_public);
+    let source_htlc = UpdateAddHtlc {
+        channel_id: canopus::channel_id::channel_id(&controller.node_public, &source_public),
+        id: 1,
+        amount_msat: 10_011_000,
+        payment_hash,
+        cltv_expiry: 700_300,
+        onion_routing_packet: Bytes::from(
+            canopus::sphinx::create_relay_onion(
+                &controller.node_public,
+                &target_public,
+                target_scid,
+                10_000_000,
+                700_100,
+                &payment_hash,
+            )
+            .unwrap(),
+        ),
+        tlv_stream: Bytes::new(),
+    };
+    controller
+        .handle_update_add(&source_public, source_htlc)
+        .await
+        .unwrap();
+    node.fail_send_custom_msg_after_successes(1, "hosted destination offline");
+    commit_peer_updates(&controller, &source_public, &source_secret).await;
+
+    assert_eq!(
+        controller.get_status(&target_public).await.unwrap(),
+        Status::Errored
+    );
+    let source_fail = node
+        .sent_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|(peer, bytes)| {
+            if peer == &source_public {
+                match HostedMessage::decode(bytes).unwrap() {
+                    HostedMessage::UpdateFailHtlc(fail) => Some(fail),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        });
+    assert!(matches!(
+        source_fail,
+        Some(UpdateFailHtlc { id: 1, reason, .. }) if reason.len() == 256
+    ));
+
+    let key = ChannelController::forward_key(target_scid, 1);
+    let key_ref: Vec<&str> = key.iter().map(|part| part.as_str()).collect();
+    assert!(get_json::<ForwardLink>(controller.store.as_ref(), &key_ref)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
