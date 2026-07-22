@@ -114,6 +114,7 @@ Registered RPC methods:
 - `canopus-status`: no args. Shows locked/unlocked runtime state.
 - `canopus-unlock`: supports `passphrase=...` or `passphrase_file=...` and requires exactly one.
 - `canopus-list`: no args. Lists known hosted channels and derived status.
+- `canopus-uninstall`: no args. Removes all Canopus datastore entries after confirming no hosted channels exist.
 - `canopus-channel`: supports `peer_id=...`; returns full persisted channel data.
 - `canopus-lcss`: supports `peer_id=...`; returns the persisted last cross-signed state.
 - `canopus-verify`: supports `lcss_file=...` and `peer_id=...`; verifies both signatures in a `canopus-lcss` JSON export.

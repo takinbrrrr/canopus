@@ -137,6 +137,11 @@ async fn main() -> anyhow::Result<()> {
                 .description("List all hosted channels known to canopus, returning each peer id and derived channel status."),
         )
         .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopus-uninstall", handler::handle_uninstall)
+                .usage("")
+                .description("Remove all canopus datastore entries. Refuses while any hosted channels exist."),
+        )
+        .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-channel", handler::handle_channel)
                 .usage("peer_id")
                 .description("Show the full persisted hosted-channel state for peer_id, including the current status and channel data. Returns null if no channel is known for that peer."),
@@ -423,6 +428,7 @@ mod handler {
         format_short_channel_id, hosted_short_channel_id, parse_short_channel_id,
     };
     use canopus::node::{HtlcResolution, PaymentStatus};
+    use canopus::store::{delete_subtree, Store};
     use canopus::wire::codecs::UpdateAddHtlc;
     use canopus::wire::lcss::LastCrossSignedState;
     use canopus::wire::{
@@ -507,6 +513,13 @@ mod handler {
                 Ok(passphrase)
             }
         }
+    }
+
+    pub(super) async fn uninstall_store(store: &dyn Store) -> Result<usize, cln_plugin::Error> {
+        if !store.list(&["canopus", "channels"]).await?.is_empty() {
+            anyhow::bail!("cannot uninstall while hosted channels exist");
+        }
+        Ok(delete_subtree(store, &["canopus"]).await?)
     }
 
     pub(super) fn verify_lcss_export(
@@ -1164,6 +1177,15 @@ mod handler {
         Ok(json!({ "channels": channels }))
     }
 
+    pub async fn handle_uninstall(
+        plugin: Plugin<PluginState>,
+        _request: Value,
+    ) -> Result<Value, cln_plugin::Error> {
+        let controller = controller(&plugin).await?;
+        let deleted = uninstall_store(controller.store.as_ref()).await?;
+        Ok(json!({ "ok": true, "deleted": deleted }))
+    }
+
     pub async fn handle_channel(
         plugin: Plugin<PluginState>,
         request: Value,
@@ -1591,6 +1613,34 @@ mod tests {
             .unwrap(),
             (true, false)
         );
+    }
+
+    #[tokio::test]
+    async fn uninstall_store_requires_no_channels() {
+        use canopus::store::{MemoryStore, Store};
+
+        let store = MemoryStore::new();
+        store
+            .create(&["canopus", "channels", "peer"], b"channel")
+            .await
+            .unwrap();
+        assert!(handler::uninstall_store(&store).await.is_err());
+
+        store
+            .delete(&["canopus", "channels", "peer"])
+            .await
+            .unwrap();
+        store
+            .create(&["canopus", "policy"], b"policy")
+            .await
+            .unwrap();
+        store
+            .create(&["canopus", "ledger", "1"], b"event")
+            .await
+            .unwrap();
+
+        assert_eq!(handler::uninstall_store(&store).await.unwrap(), 2);
+        assert!(store.list(&["canopus"]).await.unwrap().is_empty());
     }
 
     #[test]

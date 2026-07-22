@@ -123,6 +123,14 @@ List all hosted channels.
 lightning-cli canopus-list
 ```
 
+### `canopus-uninstall`
+
+Remove all Canopus datastore entries. This refuses to run while any hosted channels exist; remove every channel first.
+
+```bash
+lightning-cli canopus-uninstall
+```
+
 ### `canopus-channel peer_id`
 
 Get detailed information about a specific channel, including the derived hosted `short_channel_id` in BOLT `blockheightxtxindexxoutnum` format.

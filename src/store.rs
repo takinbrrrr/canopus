@@ -242,6 +242,36 @@ pub trait Store: Send + Sync {
     async fn list(&self, prefix: &[&str]) -> StoreResult<Vec<Vec<String>>>;
 }
 
+/// Delete every entry below a datastore prefix, including the prefix when it is an exact key.
+pub async fn delete_subtree(store: &dyn Store, root: &[&str]) -> StoreResult<usize> {
+    let root: Vec<String> = root.iter().map(|part| (*part).to_string()).collect();
+    let mut pending = vec![(root, false)];
+    let mut deleted = 0;
+
+    while let Some((key, visited)) = pending.pop() {
+        let key_ref: Vec<&str> = key.iter().map(String::as_str).collect();
+        if visited {
+            if !store.exists(&key_ref).await? {
+                continue;
+            }
+            match store.delete(&key_ref).await {
+                Ok(()) => deleted += 1,
+                Err(StoreError::NotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+            continue;
+        }
+
+        let children = store.list(&key_ref).await?;
+        pending.push((key, true));
+        for child in children {
+            pending.push((child, false));
+        }
+    }
+
+    Ok(deleted)
+}
+
 #[async_trait]
 impl<T: Store + ?Sized> Store for Arc<T> {
     async fn get(&self, key: &[&str]) -> StoreResult<GenerationValue> {
@@ -572,6 +602,24 @@ mod tests {
         assert!(store.exists(&key).await.unwrap());
         store.delete(&key).await.unwrap();
         assert!(!store.exists(&key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_subtree_removes_nested_entries() {
+        let store = MemoryStore::new();
+        store
+            .create(&["canopus", "policy"], b"policy")
+            .await
+            .unwrap();
+        store
+            .create(&["canopus", "ledger", "1"], b"event")
+            .await
+            .unwrap();
+        store.create(&["other", "key"], b"other").await.unwrap();
+
+        assert_eq!(delete_subtree(&store, &["canopus"]).await.unwrap(), 2);
+        assert!(store.list(&["canopus"]).await.unwrap().is_empty());
+        assert!(store.exists(&["other", "key"]).await.unwrap());
     }
 
     #[tokio::test]
