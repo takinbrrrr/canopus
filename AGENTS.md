@@ -104,9 +104,9 @@ The helper behavior in `main.rs` is:
 Examples:
 
 ```bash
-lightning-cli canopus-channel peerid=02...
+lightning-cli canopus-channel peer_id=02...
 lightning-cli canopus-channel 02...
-lightning-cli canopus-setchannel peerid=02... feebase_msat=2000 feeppm=500
+lightning-cli canopus-setchannel peer_id=02... feebase_msat=2000 feeppm=500
 ```
 
 Registered RPC methods:
@@ -114,15 +114,15 @@ Registered RPC methods:
 - `canopus-status`: no args. Shows locked/unlocked runtime state.
 - `canopus-unlock`: supports `passphrase=...` or `passphrase_file=...` and requires exactly one.
 - `canopus-list`: no args. Lists known hosted channels and derived status.
-- `canopus-channel`: supports `peerid=...`; returns full persisted channel data.
-- `canopus-removehc`: supports `peerid=...` and `force=...`; refuses removal with in-flight/pending HTLCs unless forced.
+- `canopus-channel`: supports `peer_id=...`; returns full persisted channel data.
+- `canopus-removehc`: supports `peer_id=...` and `force=...`; refuses removal with in-flight/pending HTLCs unless forced.
 - `canopus-addsecret`: supports `secret=...`, `capacity_msat=...`, `initial_balance_msat=...`.
 - `canopus-removesecret`: supports `secret=...`.
 - `canopus-listsecrets`: no args.
-- `canopus-reset`: supports `peerid=...`, optional `new_local_balance_msat=...`; recovery command for errored/overriding channels.
+- `canopus-reset`: supports `peer_id=...`, optional `new_local_balance_msat=...`; recovery command for errored/overriding channels.
 - `canopus-policy`: supports named policy fields; updates global defaults used for new channels.
-- `canopus-setchannel`: supports `peerid=...` plus optional per-channel fields; see the channel policy section.
-- `canopus-events`: supports optional `peerid=...`.
+- `canopus-setchannel`: supports `peer_id=...` plus optional per-channel fields; see the channel policy section.
+- `canopus-events`: supports optional `peer_id=...`.
 
 The public `canopus-resize` RPC was replaced by `canopus-setchannel`. The wire-level poncho `resize_channel` custom message still exists and is handled internally for client-driven resize compatibility.
 
@@ -201,7 +201,7 @@ Per-channel state and routing policy:
 
 ## `canopus-setchannel` Semantics
 
-`canopus-setchannel peerid` with no optional fields is read-only and returns the current channel parameters. It is allowed even if HTLCs are in flight.
+`canopus-setchannel peer_id` with no optional fields is read-only and returns the current channel parameters. It is allowed even if HTLCs are in flight.
 
 Optional fields update only when specified:
 
@@ -234,7 +234,7 @@ LCSS-affecting updates:
 Balance semantics for setchannel and reset:
 
 - In host-side LCSS, `local_balance_msat` is host balance and `remote_balance_msat` is client balance.
-- `canopus-reset peerid new_local_balance_msat` is different: it takes host/local balance and computes client/remote balance as `capacity - new_local_balance_msat`.
+- `canopus-reset peer_id new_local_balance_msat` is different: it takes host/local balance and computes client/remote balance as `capacity - new_local_balance_msat`.
 
 Keep `canopus-reset` as a separate emergency recovery command. It only works in `Errored` or `Overriding` status and clears HTLCs as part of reset. `canopus-setchannel` is an administrative configuration command for healthy active channels and rejects in-flight HTLCs.
 
@@ -242,7 +242,7 @@ Keep `canopus-reset` as a separate emergency recovery command. It only works in 
 
 Hosted channel updates are PHC-wrapped BOLT-7 `channel_update` bodies sent as `HostedMessage::PhcChannelUpdate` with tag `64507` (`TAG_PHC_CHANNEL_UPDATE_SYNC`). cliche/immortan expect this PHC sync tag for direct peer updates, not standard tag `258`.
 
-`send_channel_update(peerid)` builds the advertised policy from:
+`send_channel_update(peer_id)` builds the advertised policy from:
 
 - LCSS/init fields for capacity, max in-flight, HTLC minimum, and max accepted HTLC count.
 - `ChannelData.routing_policy` for fee base, fee ppm, CLTV delta, and HTLC maximum.
@@ -503,7 +503,7 @@ Ledger behavior:
 
 - Channel open, resize, override, HTLC forwarded, HTLC fulfilled, and HTLC failed events are recorded.
 - `record_once` provides idempotency by event id.
-- `canopus-events [peerid]` lists events.
+- `canopus-events [peer_id]` lists events.
 - Custom notifications are emitted for consumers.
 
 When adding new balance-affecting behavior, add ledger coverage or explicitly explain why no event should be recorded.

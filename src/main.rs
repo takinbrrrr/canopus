@@ -138,13 +138,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-channel", handler::handle_channel)
-                .usage("peerid")
-                .description("Show the full persisted hosted-channel state for peerid, including the current status and channel data. Returns null if no channel is known for that peer."),
+                .usage("peer_id")
+                .description("Show the full persisted hosted-channel state for peer_id, including the current status and channel data. Returns null if no channel is known for that peer."),
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-removehc", handler::handle_remove_hc)
-                .usage("peerid [force]")
-                .description("Remove the hosted channel for peerid. Refuses to remove channels with in-flight HTLCs or pending updates unless force=true or --force is passed."),
+                .usage("peer_id [force]")
+                .description("Remove the hosted channel for peer_id. Refuses to remove channels with in-flight HTLCs or pending updates unless force=true or --force is passed."),
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-addsecret", handler::handle_add_secret)
@@ -166,13 +166,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-reset", handler::handle_reset)
-                .usage("peerid [new_local_balance_msat]")
+                .usage("peer_id [new_local_balance_msat]")
                 .description("Propose a state_override for an errored hosted channel. If new_local_balance_msat is provided, the override uses that local balance; otherwise canopus proposes a reset from current state."),
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-setchannel", handler::handle_set_channel)
-                .usage("peerid [channel_capacity_msat] [initial_client_balance_msat] [feebase_msat] [feeppm] [cltv_expiry_delta] [htlc_minimum_msat] [htlc_maximum_msat] [maxhtlcs]")
-                .description("Show or update per-channel hosted routing parameters for peerid. Omitted fields keep their current values; updates are refused while HTLCs are in flight."),
+                .usage("peer_id [channel_capacity_msat] [initial_client_balance_msat] [feebase_msat] [feeppm] [cltv_expiry_delta] [htlc_minimum_msat] [htlc_maximum_msat] [maxhtlcs]")
+                .description("Show or update per-channel hosted routing parameters for peer_id. Omitted fields keep their current values; updates are refused while HTLCs are in flight."),
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-policy", handler::handle_policy)
@@ -181,8 +181,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-events", handler::handle_events)
-                .usage("[peerid]")
-                .description("List canopus accounting events. When peerid is supplied, only events for that hosted-channel peer are returned."),
+                .usage("[peer_id]")
+                .description("List canopus accounting events. When peer_id is supplied, only events for that hosted-channel peer are returned."),
         )
         .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-status", handler::handle_status)
@@ -1127,9 +1127,9 @@ mod handler {
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
-        let peer = arg(&request, 0, "peerid")
+        let peer = arg(&request, 0, "peer_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing peerid"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing peer_id"))?;
         let peer = parse_peer(peer)?;
         let controller = controller(&plugin).await?;
         let Some(data) = controller.get_channel_data(&peer).await? else {
@@ -1148,9 +1148,9 @@ mod handler {
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
-        let peer = arg(&request, 0, "peerid")
+        let peer = arg(&request, 0, "peer_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing peerid"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing peer_id"))?;
         let peer = parse_peer(peer)?;
         let force = parse_force(param(&request, "force").or_else(|| arg(&request, 1, "force")));
         controller(&plugin)
@@ -1204,9 +1204,9 @@ mod handler {
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
-        let peer = arg(&request, 0, "peerid")
+        let peer = arg(&request, 0, "peer_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing peerid"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing peer_id"))?;
         let peer = parse_peer(peer)?;
         let balance = arg(&request, 1, "new_local_balance_msat").and_then(|v| v.as_u64());
         controller(&plugin)
@@ -1220,7 +1220,7 @@ mod handler {
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
-        let peer = arg(&request, 0, "peerid").and_then(|v| v.as_str());
+        let peer = arg(&request, 0, "peer_id").and_then(|v| v.as_str());
         let ledger = ledger(&plugin).await?;
         let events = ledger.list_events(peer).await?;
         Ok(json!({ "events": events }))
@@ -1288,9 +1288,9 @@ mod handler {
         plugin: Plugin<PluginState>,
         request: Value,
     ) -> Result<Value, cln_plugin::Error> {
-        let peer = arg(&request, 0, "peerid")
+        let peer = arg(&request, 0, "peer_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing peerid"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing peer_id"))?;
         let peer = parse_peer(peer)?;
         let params = SetChannelParams {
             channel_capacity_msat: param(&request, "channel_capacity_msat")

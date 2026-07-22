@@ -123,7 +123,7 @@ List all hosted channels.
 lightning-cli canopus-list
 ```
 
-### `canopus-channel peerid`
+### `canopus-channel peer_id`
 
 Get detailed information about a specific channel, including the derived hosted `short_channel_id` in BOLT `blockheightxtxindexxoutnum` format.
 
@@ -156,7 +156,7 @@ List all secrets (hex-encoded, redacted).
 lightning-cli canopus-listsecrets
 ```
 
-### `canopus-reset peerid [new_local_balance_msat]`
+### `canopus-reset peer_id [new_local_balance_msat]`
 
 Reset an errored channel by proposing a `state_override`. Uses the last known counterparty-signed cross-signed state. Optionally specify a new local balance.
 
@@ -172,9 +172,9 @@ Get or update the default hosted-channel policy used for new channels. Supported
 lightning-cli canopus-policy fee_base_msat=2000 fee_proportional_millionths=500 htlc_minimum_msat=1000 max_accepted_htlcs=24 cltv_expiry_delta=144
 ```
 
-### `canopus-setchannel peerid [fields...]`
+### `canopus-setchannel peer_id [fields...]`
 
-Get or update per-channel hosted routing parameters. With only `peerid`, the command returns the current channel parameters. Optional fields update only when specified: `channel_capacity_msat`, `initial_client_balance_msat`, `feebase_msat`, `feeppm`, `cltv_expiry_delta`, `htlc_minimum_msat`, `htlc_maximum_msat`, and `maxhtlcs`.
+Get or update per-channel hosted routing parameters. With only `peer_id`, the command returns the current channel parameters. Optional fields update only when specified: `channel_capacity_msat`, `initial_client_balance_msat`, `feebase_msat`, `feeppm`, `cltv_expiry_delta`, `htlc_minimum_msat`, `htlc_maximum_msat`, and `maxhtlcs`.
 
 Updates are rejected while HTLCs are in flight. Routing-only changes are persisted immediately and announced with a fresh channel update. Changes to LCSS-backed fields such as channel capacity, client balance, HTLC minimum, or max HTLC count are rejected for active channels by default; use `canopus-reset` on an errored channel for state-override recovery.
 
@@ -183,11 +183,11 @@ Pass `force=true` or `--force` only for an explicit administrative override. Thi
 If the channel is already overriding, `canopus-setchannel` updates the pending proposal and sends the latest `state_override` again. Reconnect replays only the last persisted proposal.
 
 ```bash
-lightning-cli canopus-setchannel peerid=028789... feebase_msat=2000 feeppm=500 cltv_expiry_delta=144 htlc_maximum_msat=50000000
-lightning-cli canopus-setchannel peerid=028789... channel_capacity_msat=120000000 force=true
+lightning-cli canopus-setchannel peer_id=028789... feebase_msat=2000 feeppm=500 cltv_expiry_delta=144 htlc_maximum_msat=50000000
+lightning-cli canopus-setchannel peer_id=028789... channel_capacity_msat=120000000 force=true
 ```
 
-### `canopus-events [peerid]`
+### `canopus-events [peer_id]`
 
 List accounting events, optionally filtered by peer.
 
@@ -326,12 +326,12 @@ Since the sandbox environment doesn't have lightningd, bitcoind, or cliche insta
 8. Test error recovery:
    ```bash
    # Force an error (e.g., disconnect mid-payment)
-   lightning-cli canopus-reset <peerid>
+   lightning-cli canopus-reset <peer_id>
    ```
 
 9. Verify accounting:
    ```bash
-   lightning-cli canopus-events <peerid>
+   lightning-cli canopus-events <peer_id>
    ```
 
 ### Interop Notes
