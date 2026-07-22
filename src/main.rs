@@ -142,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
                 .description("Show the full persisted hosted-channel state for peer_id, including the current status and channel data. Returns null if no channel is known for that peer."),
         )
         .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopus-lcss", handler::handle_lcss)
+                .usage("peer_id")
+                .description("Show the persisted last cross-signed state for peer_id. Returns null if no channel is known for that peer."),
+        )
+        .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-removehc", handler::handle_remove_hc)
                 .usage("peer_id [force]")
                 .description("Remove the hosted channel for peer_id. Refuses to remove channels with in-flight HTLCs or pending updates unless force=true or --force is passed."),
@@ -1142,6 +1147,20 @@ mod handler {
             "short_channel_id": format_short_channel_id(short_channel_id),
             "data": data
         }))
+    }
+
+    pub async fn handle_lcss(
+        plugin: Plugin<PluginState>,
+        request: Value,
+    ) -> Result<Value, cln_plugin::Error> {
+        let peer = arg(&request, 0, "peer_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing peer_id"))?;
+        let peer = parse_peer(peer)?;
+        let Some(data) = controller(&plugin).await?.get_channel_data(&peer).await? else {
+            return Ok(json!({ "lcss": null }));
+        };
+        Ok(json!({ "peer_id": peer.to_string(), "lcss": data.lcss }))
     }
 
     pub async fn handle_remove_hc(

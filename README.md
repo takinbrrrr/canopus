@@ -131,6 +131,14 @@ Get detailed information about a specific channel, including the derived hosted 
 lightning-cli canopus-channel 028789... 
 ```
 
+### `canopus-lcss peer_id`
+
+Dump the persisted last cross-signed state for a hosted channel as JSON.
+
+```bash
+lightning-cli canopus-lcss peer_id=028789...
+```
+
 ### `canopus-addsecret secret capacity_msat initial_balance_msat`
 
 Add a one-time channel provisioning secret. The secret must be a 64-character hex string representing 32 random bytes. When a client invokes with this secret, they get a channel with the specified capacity and initial balance. The secret is consumed atomically on use.
