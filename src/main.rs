@@ -147,6 +147,11 @@ async fn main() -> anyhow::Result<()> {
                 .description("Show the persisted last cross-signed state for peer_id. Returns null if no channel is known for that peer."),
         )
         .rpcmethod_from_builder(
+            cln_plugin::RpcMethodBuilder::new("canopus-verify", handler::handle_verify)
+                .usage("lcss_file peer_id")
+                .description("Verify that the last cross-signed state exported by canopus-lcss is signed by peer_id."),
+        )
+        .rpcmethod_from_builder(
             cln_plugin::RpcMethodBuilder::new("canopus-removehc", handler::handle_remove_hc)
                 .usage("peer_id [force]")
                 .description("Remove the hosted channel for peer_id. Refuses to remove channels with in-flight HTLCs or pending updates unless force=true or --force is passed."),
@@ -419,6 +424,7 @@ mod handler {
     };
     use canopus::node::{HtlcResolution, PaymentStatus};
     use canopus::wire::codecs::UpdateAddHtlc;
+    use canopus::wire::lcss::LastCrossSignedState;
     use canopus::wire::{
         HostedMessage, TAG_ANNOUNCEMENT_SIGNATURE, TAG_ASK_BRANDING_INFO, TAG_ERROR,
         TAG_HOSTED_CHANNEL_BRANDING, TAG_INIT_HOSTED_CHANNEL, TAG_INVOKE_HOSTED_CHANNEL,
@@ -501,6 +507,36 @@ mod handler {
                 Ok(passphrase)
             }
         }
+    }
+
+    pub(super) fn verify_lcss_export(
+        lcss_file: &str,
+        remote_peer: &PublicKey,
+        local_node: &PublicKey,
+    ) -> Result<(bool, bool), cln_plugin::Error> {
+        let contents = std::fs::read_to_string(lcss_file)
+            .map_err(|e| anyhow::anyhow!("cannot read lcss_file {lcss_file}: {e}"))?;
+        let export: Value = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("cannot parse lcss_file {lcss_file}: {e}"))?;
+        let export_peer = export
+            .get("peer_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("lcss_file is missing peer_id"))?;
+        let export_peer = parse_peer(export_peer)?;
+        if export_peer != *remote_peer {
+            anyhow::bail!("lcss_file peer_id does not match peer_id");
+        }
+        let lcss: LastCrossSignedState = serde_json::from_value(
+            export
+                .get("lcss")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("lcss_file is missing lcss"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("cannot parse lcss in lcss_file: {e}"))?;
+        Ok((
+            lcss.verify_remote_sig(remote_peer),
+            lcss.reverse().verify_remote_sig(local_node),
+        ))
     }
 
     fn param<'a>(request: &'a Value, key: &str) -> Option<&'a Value> {
@@ -1163,6 +1199,28 @@ mod handler {
         Ok(json!({ "peer_id": peer.to_string(), "lcss": data.lcss }))
     }
 
+    pub async fn handle_verify(
+        plugin: Plugin<PluginState>,
+        request: Value,
+    ) -> Result<Value, cln_plugin::Error> {
+        let lcss_file = arg(&request, 0, "lcss_file")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing lcss_file"))?;
+        let peer = arg(&request, 1, "peer_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing peer_id"))?;
+        let peer = parse_peer(peer)?;
+        let local_node = controller(&plugin).await?.node_public;
+        let (remote_signature_valid, local_signature_valid) =
+            verify_lcss_export(lcss_file, &peer, &local_node)?;
+        Ok(json!({
+            "peer_id": peer.to_string(),
+            "remote_signature_valid": remote_signature_valid,
+            "local_signature_valid": local_signature_valid,
+            "valid": remote_signature_valid && local_signature_valid,
+        }))
+    }
+
     pub async fn handle_remove_hc(
         plugin: Plugin<PluginState>,
         request: Value,
@@ -1460,6 +1518,78 @@ mod tests {
         assert_eq!(
             handler::arg(&nested, 0, "secret").and_then(|value| value.as_str()),
             Some("nested-secret")
+        );
+    }
+
+    #[test]
+    fn verify_lcss_export_checks_both_signatures() {
+        let secp = secp256k1::Secp256k1::new();
+        let (remote_secret, remote_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        let (local_secret, local_public) = secp.generate_keypair(&mut rand::rngs::OsRng);
+        let mut host_view = canopus::wire::lcss::LastCrossSignedState {
+            is_host: true,
+            last_refund_scriptpubkey: bytes::Bytes::new(),
+            init_hosted_channel: canopus::wire::lcss::InitHostedChannel {
+                max_htlc_value_in_flight_msat: 100_000,
+                htlc_minimum_msat: 1_000,
+                max_accepted_htlcs: 12,
+                channel_capacity_msat: 100_000,
+                initial_client_balance_msat: 0,
+                features: vec![],
+            },
+            block_day: 0,
+            local_balance_msat: 100_000,
+            remote_balance_msat: 0,
+            local_updates: 0,
+            remote_updates: 0,
+            incoming_htlcs: vec![],
+            outgoing_htlcs: vec![],
+            remote_sig_of_local: [0; 64],
+            local_sig_of_remote: [0; 64],
+        };
+        host_view.sign(&local_secret).unwrap();
+        let mut remote_view = host_view.reverse();
+        remote_view.sign(&remote_secret).unwrap();
+        host_view.remote_sig_of_local = remote_view.local_sig_of_remote;
+
+        let export = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            export.path(),
+            serde_json::to_vec(&serde_json::json!({
+                "peer_id": remote_public.to_string(),
+                "lcss": host_view,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            handler::verify_lcss_export(
+                export.path().to_str().unwrap(),
+                &remote_public,
+                &local_public,
+            )
+            .unwrap(),
+            (true, true)
+        );
+
+        host_view.local_sig_of_remote = [0; 64];
+        std::fs::write(
+            export.path(),
+            serde_json::to_vec(&serde_json::json!({
+                "peer_id": remote_public.to_string(),
+                "lcss": host_view,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            handler::verify_lcss_export(
+                export.path().to_str().unwrap(),
+                &remote_public,
+                &local_public,
+            )
+            .unwrap(),
+            (true, false)
         );
     }
 

@@ -139,6 +139,15 @@ Dump the persisted last cross-signed state for a hosted channel as JSON.
 lightning-cli canopus-lcss peer_id=028789...
 ```
 
+### `canopus-verify lcss_file peer_id`
+
+Verify both peer signatures in a JSON file exported by `canopus-lcss`. The supplied `peer_id` must match the export's `peer_id`; verifying the local signature uses the unlocked Canopus node key.
+
+```bash
+lightning-cli canopus-lcss peer_id=028789... > lcss.json
+lightning-cli canopus-verify lcss_file=lcss.json peer_id=028789...
+```
+
 ### `canopus-addsecret secret capacity_msat initial_balance_msat`
 
 Add a one-time channel provisioning secret. The secret must be a 64-character hex string representing 32 random bytes. When a client invokes with this secret, they get a channel with the specified capacity and initial balance. The secret is consumed atomically on use.

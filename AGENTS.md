@@ -116,6 +116,7 @@ Registered RPC methods:
 - `canopus-list`: no args. Lists known hosted channels and derived status.
 - `canopus-channel`: supports `peer_id=...`; returns full persisted channel data.
 - `canopus-lcss`: supports `peer_id=...`; returns the persisted last cross-signed state.
+- `canopus-verify`: supports `lcss_file=...` and `peer_id=...`; verifies both signatures in a `canopus-lcss` JSON export.
 - `canopus-removehc`: supports `peer_id=...` and `force=...`; refuses removal with in-flight/pending HTLCs unless forced.
 - `canopus-addsecret`: supports `secret=...`, `capacity_msat=...`, `initial_balance_msat=...`.
 - `canopus-removesecret`: supports `secret=...`.
